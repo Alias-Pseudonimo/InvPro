@@ -117,6 +117,10 @@ export const api = {
   listSettings: () => call<Setting[]>("list_settings"),
   saveSetting: (key: string, value: string) => call<void>("save_setting", { key, value }),
 
+  // Paperwork saved to the user's computer
+  saveDocument: (fileName: string, contents: string) =>
+    call<string>("save_document", { fileName, contents }),
+
   // The ledger underneath, for anyone who wants it
   listAccounts: () => call<Account[]>("list_accounts"),
   createAccount: (input: CreateAccountInput) => call<Account>("create_account", { input }),

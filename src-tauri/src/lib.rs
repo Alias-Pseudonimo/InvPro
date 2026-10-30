@@ -451,6 +451,117 @@ fn save_setting(state: State<'_, AppState>, key: String, value: String) -> Resul
     with_session(&state, |conn| simple::put_setting(conn, &key, &value))
 }
 
+/// The folder a person means when they ask for a file on their computer.
+fn downloads_directory() -> PathBuf {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()
+        .map(PathBuf::from);
+
+    if let Some(home) = home {
+        let downloads = home.join("Downloads");
+        if downloads.is_dir() {
+            return downloads;
+        }
+        if home.is_dir() {
+            return home;
+        }
+    }
+    std::env::temp_dir()
+}
+
+/// Reduce any requested name to one harmless path segment ending in `.html`.
+fn safe_document_name(requested: &str) -> String {
+    let cleaned: String = requested
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            ch if ch.is_control() => '-',
+            ch => ch,
+        })
+        .collect();
+
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    let mut name: String = if trimmed.is_empty() {
+        "document".to_string()
+    } else {
+        trimmed.chars().take(90).collect()
+    };
+
+    if !name.to_ascii_lowercase().ends_with(".html") {
+        name.push_str(".html");
+    }
+    name
+}
+
+/// Never overwrite an earlier download: `Invoice.html`, `Invoice (2).html`, ...
+fn unused_path(directory: &std::path::Path, file_name: &str) -> PathBuf {
+    let candidate = directory.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let stem = file_name.strip_suffix(".html").unwrap_or(file_name);
+    for index in 2..10_000 {
+        let next = directory.join(format!("{stem} ({index}).html"));
+        if !next.exists() {
+            return next;
+        }
+    }
+    directory.join(format!("{stem}-{}.html", std::process::id()))
+}
+
+/// Save a printed document (invoice, P&L, tax summary, balance sheet) into the
+/// user's Downloads folder and hand back the full path so the app can show it.
+#[tauri::command]
+fn save_document(file_name: String, contents: String) -> Result<String, String> {
+    let directory = downloads_directory();
+    std::fs::create_dir_all(&directory)
+        .map_err(|err| format!("could not reach {}: {err}", directory.display()))?;
+
+    let path = unused_path(&directory, &safe_document_name(&file_name));
+    std::fs::write(&path, contents.as_bytes())
+        .map_err(|err| format!("could not save {}: {err}", path.display()))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod document_tests {
+    use super::*;
+
+    #[test]
+    fn document_names_stay_one_harmless_segment() {
+        assert_eq!(
+            safe_document_name("Invoice-INV-1001-2026-07-15.html"),
+            "Invoice-INV-1001-2026-07-15.html"
+        );
+
+        let traversal = safe_document_name("../../Windows/System32/evil");
+        assert!(!traversal.contains('/') && !traversal.contains('\\') && !traversal.contains(':'));
+        assert!(traversal.ends_with(".html"));
+
+        assert_eq!(safe_document_name("   "), "document.html");
+        assert_eq!(safe_document_name("Balance Sheet"), "Balance Sheet.html");
+    }
+
+    #[test]
+    fn an_existing_download_is_never_overwritten() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|gap| gap.as_nanos())
+            .unwrap_or(0);
+        let directory = std::env::temp_dir().join(format!("ledgerworks-docs-{stamp}"));
+        std::fs::create_dir_all(&directory).expect("temp folder");
+
+        let first = unused_path(&directory, "Balance-Sheet.html");
+        std::fs::write(&first, "x").expect("first copy");
+
+        let second = unused_path(&directory, "Balance-Sheet.html");
+        assert_eq!(second.file_name().unwrap(), "Balance-Sheet (2).html");
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -507,6 +618,7 @@ pub fn run() {
             tax_summary,
             list_settings,
             save_setting,
+            save_document
         ])
         .run(tauri::generate_context!())
         .expect("error while running LedgerWorks");

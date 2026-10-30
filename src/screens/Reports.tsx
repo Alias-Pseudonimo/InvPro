@@ -1,5 +1,7 @@
 import { useState } from "react";
-import { api } from "../api";
+import { api, isDesktop } from "../api";
+import { balanceSheetDocument, printDocument, profitAndLossDocument, saveDocument, taxSummaryDocument } from "../documents";
+import { errorText } from "../format";
 import type { AccountBalance } from "../types";
 import { ErrorNote, money, useLoad } from "../ui";
 
@@ -40,13 +42,37 @@ function Rows({ title, rows, total, tone }: { title: string; rows: AccountBalanc
 export default function ReportsScreen({ mode, revision }: { mode: Mode; revision: number }) {
   const [from, setFrom] = useState(yearStart());
   const [to, setTo] = useState(todayISO());
+  const [note, setNote] = useState<string | null>(null);
+
+  const company = useLoad(() => api.currentCompany(), [revision]).data;
 
   const pl = useLoad(() => api.profitAndLoss(from, to), [revision, from, to, mode === "pl"]);
   const sheet = useLoad(() => api.balanceSheet(to), [revision, to, mode === "balance"]);
   const tax = useLoad(() => api.taxSummary(from, to), [revision, from, to, mode === "tax"]);
 
+  /** The paper version of whatever this screen is showing. */
+  function currentDocument() {
+    if (mode === "pl" && pl.data) return profitAndLossDocument(pl.data, from, to, company);
+    if (mode === "balance" && sheet.data) return balanceSheetDocument(sheet.data, to, company);
+    if (mode === "tax" && tax.data) return taxSummaryDocument(tax.data, from, to, company);
+    return null;
+  }
+
+  async function download() {
+    const file = currentDocument();
+    if (!file) return;
+    try {
+      const where = await saveDocument(file);
+      setNote(isDesktop ? `Saved to ${where}` : `Downloaded ${where}`);
+    } catch (err) {
+      setNote(errorText(err));
+    }
+  }
+
   const error = mode === "pl" ? pl.error : mode === "balance" ? sheet.error : tax.error;
   if (error) return <ErrorNote text={error} />;
+
+  const ready = currentDocument() !== null;
 
   return (
     <>
@@ -54,17 +80,50 @@ export default function ReportsScreen({ mode, revision }: { mode: Mode; revision
         <div className="muted small">
           Every number here comes from the posted ledger, not from a separate tally — so it can never drift from your records.
         </div>
-        <div className="date-range">
-          <label>
-            From
-            <input type="date" value={from} onChange={(event) => setFrom(event.target.value)} />
-          </label>
-          <label>
-            {mode === "balance" ? "As of" : "To"}
-            <input type="date" value={to} onChange={(event) => setTo(event.target.value)} />
-          </label>
+        <div className="toolbar-actions">
+          <div className="date-range">
+            <label>
+              From
+              <input
+                type="date"
+                value={from}
+                onChange={(event) => {
+                  setFrom(event.target.value);
+                  setNote(null);
+                }}
+              />
+            </label>
+            <label>
+              {mode === "balance" ? "As of" : "To"}
+              <input
+                type="date"
+                value={to}
+                onChange={(event) => {
+                  setTo(event.target.value);
+                  setNote(null);
+                }}
+              />
+            </label>
+          </div>
+          <button
+            type="button"
+            className="btn btn-sm"
+            disabled={!ready}
+            title="Open the print dialog — choose “Microsoft Print to PDF” to keep a PDF copy"
+            onClick={() => {
+              const file = currentDocument();
+              if (file) printDocument(file.html);
+            }}
+          >
+            Print
+          </button>
+          <button type="button" className="btn btn-sm" disabled={!ready} onClick={() => void download()}>
+            Download
+          </button>
         </div>
       </div>
+
+      {note && <div className="save-note">{note}</div>}
 
       {mode === "pl" && pl.data && (
         <div className="card card-pad report">

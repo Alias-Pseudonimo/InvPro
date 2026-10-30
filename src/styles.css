@@ -375,6 +375,18 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--brass); bor
 .date-range { display: flex; gap: 12px; align-items: flex-end; }
 .date-range label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; }
 .date-range input { padding: 6px 9px; }
+.toolbar-actions { display: flex; gap: 10px; align-items: flex-end; }
+.save-note { margin: -6px 0 14px; font-size: 12px; color: var(--muted); word-break: break-all; }
+
+/* a sheet of paper inside a dialog */
+.doc-frame {
+  display: block;
+  width: 100%;
+  height: 64vh;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+}
 
 .tiny-input { width: 56px; display: inline-block; margin-left: 6px; padding: 3px 6px; }
 

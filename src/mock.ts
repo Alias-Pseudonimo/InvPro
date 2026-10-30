@@ -1267,6 +1267,21 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
       return undefined as T;
     }
 
+    case "save_document": {
+      // In the browser preview the paper arrives as an ordinary download.
+      const fileName = String(payload.fileName ?? "document.html");
+      const contents = String(payload.contents ?? "");
+      const url = URL.createObjectURL(new Blob([contents], { type: "text/html;charset=utf-8" }));
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = fileName;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 4000);
+      return fileName as T;
+    }
+
     case "list_accounts":
       requireOpen();
       return state.accounts.slice() as T;

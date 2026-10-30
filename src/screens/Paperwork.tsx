@@ -1,5 +1,6 @@
 import { useState, type ReactNode } from "react";
-import { api } from "../api";
+import { api, isDesktop } from "../api";
+import { invoiceDocument, printDocument, saveDocument } from "../documents";
 import type {
   Customer,
   InventoryItem,
@@ -134,10 +135,12 @@ export function InvoicesScreen({ revision, changed }: Props) {
   const { data, error } = useLoad(() => api.listInvoices(), [revision]);
   const customers = useLoad<Customer[]>(() => api.listCustomers(), [revision]).data ?? [];
   const items = useLoad<InventoryItem[]>(() => api.listInventory(), [revision]).data ?? [];
+  const company = useLoad(() => api.currentCompany(), [revision]).data ?? null;
 
   const schedules = useLoad<RecurringInvoice[]>(() => api.listRecurringInvoices(), [revision]).data ?? [];
 
   const [editing, setEditing] = useState<Invoice | "new" | null>(null);
+  const [viewing, setViewing] = useState<Invoice | null>(null);
   const [lines, setLines] = useState<DraftLine[]>([blankLine()]);
   const [taxPct, setTaxPct] = useState("0");
   const [formError, setFormError] = useState<string | null>(null);
@@ -254,6 +257,24 @@ export function InvoicesScreen({ revision, changed }: Props) {
     }
   }
 
+  const viewingSheet = viewing
+    ? invoiceDocument(
+        viewing,
+        company,
+        customers.find((customer) => customer.id === viewing.customerId),
+      )
+    : null;
+
+  async function saveSheet() {
+    if (!viewingSheet) return;
+    try {
+      const where = await saveDocument(viewingSheet);
+      changed(isDesktop ? `Saved to ${where}` : `Downloaded ${where}`);
+    } catch (err) {
+      window.alert(String(err));
+    }
+  }
+
   return (
     <>
       <div className="toolbar">
@@ -319,6 +340,9 @@ export function InvoicesScreen({ revision, changed }: Props) {
                       )}
                       <button type="button" className="btn btn-sm btn-ghost" onClick={() => open(invoice)}>
                         Edit
+                      </button>
+                      <button type="button" className="btn btn-sm btn-ghost" onClick={() => setViewing(invoice)}>
+                        Print
                       </button>
                       <button type="button" className="btn btn-sm btn-danger" onClick={() => void remove(invoice)}>
                         Delete
@@ -506,6 +530,28 @@ export function InvoicesScreen({ revision, changed }: Props) {
               </button>
             </div>
           </form>
+        </Modal>
+      )}
+      {viewing && viewingSheet && (
+        <Modal title={`Invoice ${viewing.invoiceNo}`} onClose={() => setViewing(null)} wide>
+          <div className="modal-body">
+            <iframe className="doc-frame" title={`Invoice ${viewing.invoiceNo}`} srcDoc={viewingSheet.html} />
+            <div className="settings-note">
+              This is exactly what prints. Print opens the system dialog — choose “Microsoft Print to PDF” for a PDF
+              copy, or Download to keep the file itself.
+            </div>
+          </div>
+          <div className="modal-foot">
+            <button type="button" className="btn btn-ghost" onClick={() => setViewing(null)}>
+              Close
+            </button>
+            <button type="button" className="btn" onClick={() => void saveSheet()}>
+              Download
+            </button>
+            <button type="button" className="btn btn-primary" onClick={() => printDocument(viewingSheet.html)}>
+              Print
+            </button>
+          </div>
         </Modal>
       )}
       {schedule && (
