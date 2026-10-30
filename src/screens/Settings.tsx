@@ -28,7 +28,9 @@ export default function SettingsScreen({
   const accounts = useLoad(() => api.listAccounts(), [revision]).data ?? [];
   const settings = useLoad(() => api.listSettings(), [revision]);
   const [map, setMap] = useState<Record<string, string>>({});
+  const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [detailsError, setDetailsError] = useState<string | null>(null);
   const [chain, setChain] = useState<ChainReport | null>(null);
   const [chainError, setChainError] = useState<string | null>(null);
 
@@ -37,6 +39,7 @@ export default function SettingsScreen({
     const next: Record<string, string> = {};
     for (const row of settings.data) next[row.key] = row.value;
     setMap(next);
+    setLoaded(true);
   }, [settings.data]);
 
   async function saveRole(key: string, value: string) {
@@ -86,6 +89,67 @@ export default function SettingsScreen({
             <strong>v{company.schemaVersion}</strong>
           </div>
           <div className="settings-note mono small">{company.path}</div>
+        </div>
+
+        <div className="card card-pad" style={{ marginTop: 16 }}>
+          <div className="panel-title">Business details</div>
+          <p className="muted small">
+            These print at the top of every invoice, report and downloaded file, so the customer knows who billed them.
+            Leave a line empty and it simply does not appear.
+          </p>
+          {loaded ? (
+            <form
+              onSubmit={submitHandler(
+                async (form) => {
+                  const values: Array<[string, string]> = [
+                    ["business_address", field(form, "address")],
+                    ["business_phone", field(form, "phone")],
+                    ["business_email", field(form, "email")],
+                    ["business_website", field(form, "website")],
+                  ];
+                  for (const [key, value] of values) await api.saveSetting(key, value);
+                  setMap((current) => ({ ...current, ...Object.fromEntries(values) }));
+                  changed("Business details saved");
+                },
+                setDetailsError,
+                () => undefined,
+              )}
+            >
+              <div className="field">
+                <label>Address</label>
+                <textarea
+                  name="address"
+                  rows={3}
+                  defaultValue={map.business_address ?? ""}
+                  placeholder={"220 Harbor Way\nAlameda, CA 94501"}
+                />
+              </div>
+              <div className="field-row">
+                <div className="field">
+                  <label>Phone</label>
+                  <input name="phone" defaultValue={map.business_phone ?? ""} placeholder="(510) 555-0142" />
+                </div>
+                <div className="field">
+                  <label>Email</label>
+                  <input name="email" defaultValue={map.business_email ?? ""} placeholder="books@riverbend.example" />
+                </div>
+              </div>
+              <div className="field">
+                <label>Website</label>
+                <input
+                  name="website"
+                  defaultValue={map.business_website ?? ""}
+                  placeholder="riverbendcontracting.example"
+                />
+              </div>
+              <button type="submit" className="btn btn-primary">
+                Save business details
+              </button>
+            </form>
+          ) : (
+            <div className="muted small">Loading…</div>
+          )}
+          {detailsError && <ErrorNote text={detailsError} />}
         </div>
 
         <div className="card card-pad" style={{ marginTop: 16 }}>

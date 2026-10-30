@@ -198,6 +198,10 @@ function seed() {
   }
   auditRow("INSERT", "accounts", state.accounts.length, { number: CHART.length });
   state.settings.company_name = `Riverbend Contracting LLC`;
+  state.settings.business_address = "1420 Harbor Way\nAlameda, CA 94501";
+  state.settings.business_phone = "(510) 555-0142";
+  state.settings.business_email = "books@riverbend.example";
+  state.settings.business_website = "riverbendcontracting.example";
 
   const customer = (name: string, email: string, phone: string, address: string): Customer => {
     const record: Customer = {
@@ -450,6 +454,10 @@ function seed() {
   payRun("T. Okafor", "2026-07-31", 3_500, 80, 0, [33_600, 11_200, 17_360, 4_060], "1059");
 
   state.settings.company_name = "Riverbend Contracting LLC";
+  state.settings.business_address = "1420 Harbor Way\nAlameda, CA 94501";
+  state.settings.business_phone = "(510) 555-0142";
+  state.settings.business_email = "books@riverbend.example";
+  state.settings.business_website = "riverbendcontracting.example";
   state.settings.cash_account = String(state.accounts.find((account) => account.number === "1000")?.id ?? 1);
   state.settings.receivable_account = String(state.accounts.find((account) => account.number === "1100")?.id ?? 2);
   state.settings.payable_account = String(state.accounts.find((account) => account.number === "2000")?.id ?? 3);

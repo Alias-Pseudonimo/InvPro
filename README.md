@@ -16,9 +16,10 @@ how much, was it in the bank or still owed?* — and the app derives the entry.
 
 Two rules keep the simplification from becoming a cage:
 
-1. **Categories are free text.** Type a category that does not exist and it
-   becomes a real account on the spot. Nothing needs setting up first, and the
-   chart grows the way the owner describes their own business.
+1. **Categories come from a list you can extend.** Income picks from the
+   categories already in use, then offers *+ New category*. A new name becomes a
+   real account on the spot, so nothing needs setting up first and the chart
+   grows the way the owner describes their own business.
 2. **Account roles are data, not code.** Which account is "money in the bank",
    which collects sales tax, which holds stock — all live in `settings` as
    account ids. Point them anywhere and every future posting follows. Nothing is
@@ -30,6 +31,7 @@ What the owner records, and what the books receive:
 | --- | --- | --- |
 | Income, already paid | Checking | the income category you typed |
 | Income, still owed | Accounts Receivable | the income category you typed |
+| Income with an invoice number | the invoice it creates or settles — revenue, tax and cash follow the invoice rules, never twice |
 | Expense, already paid | the expense category you typed | Checking |
 | Expense, still owed | the expense category you typed | Accounts Payable |
 | Invoice marked **Sent** | Accounts Receivable | revenue + sales tax payable |
@@ -47,10 +49,16 @@ Both operations appear in the audit trail.
 - **Dashboard** — money in, money out, net, cash, what you are owed, what you
   owe, sales tax collected, stock value, spending by category, recent activity.
 - **Income / Expenses** — plain records with paid/unpaid, tax rate, category,
-  customer or vendor.
+  customer or vendor. An income record can carry an invoice number: the invoice
+  is created from it (or the payment is applied to the invoice already there),
+  so one sale never becomes two documents or two lots of revenue.
 - **Invoices** — drafts are free; sending reserves receivables and takes stock
   out (booking cost of goods sold at item cost); paid moves the money to the
-  bank. Reverting restores stock and voids the revenue.
+  bank. Reverting restores stock and voids the revenue. Automatic numbers skip
+  every number already used, on an invoice or on an income record.
+- **Recurring invoices** — weekly, monthly, quarterly or yearly schedules that
+  raise a real sent invoice for each cycle, dated the day it fell due; missed
+  cycles are caught up the next time invoices are generated.
 - **Purchases** — one record updates quantity, weighted-average cost, the linked
   expense posting, and vendor history. New item names are created on the way
   through.
@@ -62,9 +70,17 @@ Both operations appear in the audit trail.
   you spent, and what is still outstanding.
 - **Reports** — Profit & Loss, Balance Sheet, Tax Summary. Every figure comes
   from posted journal lines, so a report can never drift from the ledger.
+- **Printing and saving paper** — every invoice, and each of those three
+  reports, has **Print** and **Download**. Print renders the document on its own
+  page, clean of the app, and opens the system dialog (choose *Microsoft Print to
+  PDF* for a PDF). Download writes the same document into the user's Downloads
+  folder and reports the full path; an existing file is never overwritten. Each
+  sheet carries the business details from Settings at the top, so a customer
+  sees who billed them on the paper itself.
 - **The ledger (Advanced)** — chart of accounts, manual journal, trial balance
   and audit trail for anyone who wants to see the machinery.
-- **Settings** — company file, invoice defaults, and the account roles above.
+- **Settings** — business details (address, phone, email, website, printed on
+  every document), company file, invoice defaults, and the account roles above.
 
 ## The rules that cannot be broken
 
@@ -150,23 +166,31 @@ Ordered by what the books need next, not by what is easiest:
 
 1. **Orders and shippers** — a sales pipeline that becomes an invoice, with
    shipping and tracking.
-2. **Recurring billing** — schedules that generate invoices on their cadence.
-3. **Credit memos** — returns and corrections that reduce what a customer owes.
-4. **Banking** — statement import, matching, reconciliation.
-5. **Multi-user host service** — ed25519 host identity, concurrent sessions
+2. **Credit memos** — returns and corrections that reduce what a customer owes.
+3. **Banking** — statement import, matching, reconciliation.
+4. **Multi-user host service** — ed25519 host identity, concurrent sessions
    against one company file, backup and restore.
-6. **PDF output** — invoices, statements, pay stubs.
+5. **A real PDF engine** — printing today goes through the system dialog and
+   downloads are HTML that opens and prints anywhere; statements and pay stubs
+   are not laid out yet, and no PDF is produced without the print dialog.
 
 ## Verification status
 
-`cargo test -p accounting-core`: 36 tests passing — journal invariants, raw-SQL
+`cargo test -p accounting-core`: 46 tests passing — journal invariants, raw-SQL
 rejection, immutability, audit tamper detection, and the record layer (income,
 expenses, tax, invoices with stock and cost of goods sold, invoice reverts,
-weighted-average purchases, pay runs, date-ranged reports, audit chain after a
-full day of bookkeeping).
+income-to-invoice linking and numbering, recurring cycles and end dates,
+weighted-average purchases, pay runs, date-ranged reports, schema migration from
+v2, audit chain after a full day of bookkeeping).
 
 The React app type-checks and bundles with `npm run build`.
 
-The Tauri shell cannot be compiled on the Linux machine used for development
-(it needs `webkit2gtk` system libraries, which need root); it is compile-checked
-and bundled on Windows with `npm run tauri build`.
+The Tauri shell compile-checks on Windows with
+`cargo check -p ledgerworks --all-targets`, and builds `.msi`/NSIS installers in
+CI (`npm run tauri build` locally). Its `save_document` filename handling has
+unit tests (`cargo test -p ledgerworks --lib`): a requested name stays one path
+segment and an earlier download is kept as `name (2).html`.
+
+Printed documents were verified in the running app: the P&L, Balance Sheet and
+Tax Summary each produce their own file (sections, totals and period headings
+checked in the saved bytes), and an invoice previews exactly what prints.

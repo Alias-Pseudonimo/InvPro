@@ -1,5 +1,6 @@
 import { useState, type ReactNode } from "react";
 import { api, isDesktop } from "../api";
+import { useBusinessProfile } from "../business";
 import { invoiceDocument, printDocument, saveDocument } from "../documents";
 import type {
   Customer,
@@ -136,6 +137,7 @@ export function InvoicesScreen({ revision, changed }: Props) {
   const customers = useLoad<Customer[]>(() => api.listCustomers(), [revision]).data ?? [];
   const items = useLoad<InventoryItem[]>(() => api.listInventory(), [revision]).data ?? [];
   const company = useLoad(() => api.currentCompany(), [revision]).data ?? null;
+  const profile = useBusinessProfile(revision);
 
   const schedules = useLoad<RecurringInvoice[]>(() => api.listRecurringInvoices(), [revision]).data ?? [];
 
@@ -261,6 +263,7 @@ export function InvoicesScreen({ revision, changed }: Props) {
     ? invoiceDocument(
         viewing,
         company,
+        profile,
         customers.find((customer) => customer.id === viewing.customerId),
       )
     : null;

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { api, isDesktop } from "../api";
+import { useBusinessProfile } from "../business";
 import { balanceSheetDocument, printDocument, profitAndLossDocument, saveDocument, taxSummaryDocument } from "../documents";
 import { errorText } from "../format";
 import type { AccountBalance } from "../types";
@@ -45,6 +46,7 @@ export default function ReportsScreen({ mode, revision }: { mode: Mode; revision
   const [note, setNote] = useState<string | null>(null);
 
   const company = useLoad(() => api.currentCompany(), [revision]).data;
+  const profile = useBusinessProfile(revision);
 
   const pl = useLoad(() => api.profitAndLoss(from, to), [revision, from, to, mode === "pl"]);
   const sheet = useLoad(() => api.balanceSheet(to), [revision, to, mode === "balance"]);
@@ -52,9 +54,9 @@ export default function ReportsScreen({ mode, revision }: { mode: Mode; revision
 
   /** The paper version of whatever this screen is showing. */
   function currentDocument() {
-    if (mode === "pl" && pl.data) return profitAndLossDocument(pl.data, from, to, company);
-    if (mode === "balance" && sheet.data) return balanceSheetDocument(sheet.data, to, company);
-    if (mode === "tax" && tax.data) return taxSummaryDocument(tax.data, from, to, company);
+    if (mode === "pl" && pl.data) return profitAndLossDocument(pl.data, from, to, company, profile);
+    if (mode === "balance" && sheet.data) return balanceSheetDocument(sheet.data, to, company, profile);
+    if (mode === "tax" && tax.data) return taxSummaryDocument(tax.data, from, to, company, profile);
     return null;
   }
 

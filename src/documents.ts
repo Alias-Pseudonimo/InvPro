@@ -1,4 +1,5 @@
 import { api } from "./api";
+import type { BusinessProfile } from "./business";
 import { formatCents, today } from "./format";
 import type { AccountBalance, BalanceSheet, CompanySummary, Invoice, ProfitAndLoss, TaxSummary } from "./types";
 
@@ -86,6 +87,14 @@ body {
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: #6b6a63;
+}
+.business .contact {
+  margin-top: 7px;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.55;
+  color: #6b6a63;
+  white-space: pre-line;
 }
 .doc-kind { text-align: right; }
 .doc-kind .kind { font-size: 19px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; }
@@ -177,15 +186,24 @@ function wrap(title: string, body: string): string {
 </html>`;
 }
 
+function contactLines(profile: BusinessProfile): string {
+  const lines: string[] = [];
+  if (profile.address) lines.push(escapeHtml(profile.address).replace(/\r?\n/g, "<br />"));
+  const inline = [profile.phone, profile.email, profile.website].filter(Boolean).map(escapeHtml);
+  if (inline.length > 0) lines.push(inline.join(" · "));
+  return lines.length === 0 ? "" : `<div class="contact">${lines.join("<br />")}</div>`;
+}
+
 function header(
   company: CompanySummary | null,
+  profile: BusinessProfile,
   kind: string,
   reference: string,
   when: string,
 ): string {
   const currency = company?.baseCurrency ? `Amounts in ${company.baseCurrency}` : "";
   return `<header class="doc-head">
-  <div class="business">${escapeHtml(businessName(company))}${currency ? `<small>${escapeHtml(currency)}</small>` : ""}</div>
+  <div class="business">${escapeHtml(businessName(company))}${currency ? `<small>${escapeHtml(currency)}</small>` : ""}${contactLines(profile)}</div>
   <div class="doc-kind">
     <div class="kind">${escapeHtml(kind)}</div>
     ${reference ? `<div class="no">${escapeHtml(reference)}</div>` : ""}
@@ -215,6 +233,7 @@ export interface InvoiceParty {
 export function invoiceDocument(
   invoice: Invoice,
   company: CompanySummary | null,
+  profile: BusinessProfile,
   customer?: InvoiceParty,
 ): DocumentFile {
   const taxPct = invoice.taxBp / 100;
@@ -260,7 +279,7 @@ export function invoiceDocument(
           : `Payment due on receipt.`;
 
   const title = `Invoice ${invoice.invoiceNo}`;
-  const body = `${header(company, "Invoice", invoice.invoiceNo, `Issued ${prettyDate(invoice.invoiceDate)}`)}
+  const body = `${header(company, profile, "Invoice", invoice.invoiceNo, `Issued ${prettyDate(invoice.invoiceDate)}`)}
 ${billTo}
 <table>
   <thead><tr><th>Description</th><th class="num">Qty</th><th class="num">Price</th><th class="num">Amount</th></tr></thead>
@@ -297,9 +316,10 @@ export function profitAndLossDocument(
   from: string,
   to: string,
   company: CompanySummary | null,
+  profile: BusinessProfile,
 ): DocumentFile {
   const period = `${prettyDate(from)} to ${prettyDate(to)}`;
-  const body = `${header(company, "Profit & Loss", "", period)}
+  const body = `${header(company, profile, "Profit & Loss", "", period)}
 ${section("Income", report.income, report.totalIncomeCents, "No income in this period.")}
 ${section("Costs and expenses", report.expenses, report.totalExpenseCents, "No costs in this period.")}
 <div class="conclusion"><span>Net profit</span><span>${dollars(report.netCents)}</span></div>
@@ -311,8 +331,9 @@ export function balanceSheetDocument(
   report: BalanceSheet,
   asOf: string,
   company: CompanySummary | null,
+  profile: BusinessProfile,
 ): DocumentFile {
-  const body = `${header(company, "Balance Sheet", "", `As of ${prettyDate(asOf)}`)}
+  const body = `${header(company, profile, "Balance Sheet", "", `As of ${prettyDate(asOf)}`)}
 ${section("Assets", report.assets, report.totalAssetsCents, "No assets.")}
 ${section("Liabilities", report.liabilities, report.totalLiabilitiesCents, "No liabilities.")}
 ${section("Equity", report.equity, report.totalEquityCents, "No equity accounts.")}
@@ -327,10 +348,11 @@ export function taxSummaryDocument(
   from: string,
   to: string,
   company: CompanySummary | null,
+  profile: BusinessProfile,
 ): DocumentFile {
   const line = (label: string, cents: number) =>
     `<div class="row-line"><span>${escapeHtml(label)}</span><span class="value">${dollars(cents)}</span></div>`;
-  const body = `${header(company, "Tax Summary", "", `${prettyDate(from)} to ${prettyDate(to)}`)}
+  const body = `${header(company, profile, "Tax Summary", "", `${prettyDate(from)} to ${prettyDate(to)}`)}
 ${line("Sales with tax", report.taxableSalesCents)}
 ${line("Sales without tax", report.untaxedSalesCents)}
 ${line("Sales tax collected", report.salesTaxCollectedCents)}
