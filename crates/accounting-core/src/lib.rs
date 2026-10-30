@@ -26,6 +26,7 @@
 pub mod accounts;
 pub mod audit;
 pub mod company;
+pub mod dates;
 pub mod db;
 pub mod error;
 pub mod journal;

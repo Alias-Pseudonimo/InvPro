@@ -209,6 +209,7 @@ export interface IncomeRecord {
   totalCents: number;
   isPaid: boolean;
   invoiceNo: string;
+  invoiceId: number | null;
   journalEntryId: number | null;
 }
 
@@ -293,6 +294,36 @@ export interface InvoiceInput {
   dueDate?: string | null;
   status: InvoiceStatus;
   taxBp: number;
+  lines: InvoiceLineInput[];
+}
+
+export type RecurringFrequency = "Weekly" | "Monthly" | "Quarterly" | "Yearly";
+
+export interface RecurringInvoice {
+  id: number;
+  customerId: number | null;
+  customerName: string;
+  description: string;
+  frequency: RecurringFrequency;
+  startDate: string;
+  nextDate: string;
+  endDate: string | null;
+  taxBp: number;
+  isActive: boolean;
+  subtotalCents: number;
+  totalCents: number;
+  lines: InvoiceLine[];
+}
+
+export interface RecurringInvoiceInput {
+  id?: number | null;
+  customerId?: number | null;
+  description?: string;
+  frequency: RecurringFrequency;
+  startDate: string;
+  endDate?: string | null;
+  taxBp: number;
+  isActive?: boolean;
   lines: InvoiceLineInput[];
 }
 

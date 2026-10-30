@@ -1708,6 +1708,7 @@ name = "ledgerworks"
 version = "0.1.0"
 dependencies = [
  "accounting-core",
+ "rusqlite",
  "serde",
  "serde_json",
  "tauri",

@@ -12,7 +12,8 @@ use accounting_core::reports::{self, TrialBalanceReport};
 use accounting_core::simple::{
     self, BalanceSheet, Customer, Dashboard, ExpenseInput, ExpenseRecord, IncomeInput,
     IncomeRecord, InventoryInput, InventoryItem, Invoice, InvoiceInput, PartyInput, PayrollInput,
-    PayrollRun, ProfitAndLoss, Purchase, PurchaseInput, Setting, TaxSummary, Vendor,
+    PayrollRun, ProfitAndLoss, Purchase, PurchaseInput, RecurringInvoice, RecurringInvoiceInput,
+    Setting, TaxSummary, Vendor,
 };
 use accounting_core::{db, CoreError};
 use rusqlite::Connection;
@@ -122,7 +123,7 @@ fn create_company(
     )
     .map_err(error_text)?;
 
-    let mut conn = db::open(std::path::Path::new(&created.path)).map_err(error_text)?;
+    let conn = db::open(std::path::Path::new(&created.path)).map_err(error_text)?;
     db::set_actor(&conn, &resolve_actor(input.actor)).map_err(error_text)?;
 
     let mut guard = state
@@ -134,7 +135,6 @@ fn create_company(
         conn,
     });
     drop(guard);
-    let _ = &mut conn;
     Ok(created)
 }
 
@@ -351,6 +351,32 @@ fn delete_invoice(state: State<'_, AppState>, id: i64) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn list_recurring_invoices(state: State<'_, AppState>) -> Result<Vec<RecurringInvoice>, String> {
+    with_session(&state, |conn| simple::list_recurring_invoices(conn))
+}
+
+#[tauri::command]
+fn save_recurring_invoice(
+    state: State<'_, AppState>,
+    input: RecurringInvoiceInput,
+) -> Result<RecurringInvoice, String> {
+    with_session(&state, |conn| simple::save_recurring_invoice(conn, &input))
+}
+
+#[tauri::command]
+fn delete_recurring_invoice(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    with_session(&state, |conn| simple::delete_recurring_invoice(conn, id))
+}
+
+#[tauri::command]
+fn generate_due_invoices(
+    state: State<'_, AppState>,
+    today: String,
+) -> Result<Vec<Invoice>, String> {
+    with_session(&state, |conn| simple::generate_due_invoices(conn, &today))
+}
+
+#[tauri::command]
 fn list_purchases(state: State<'_, AppState>) -> Result<Vec<Purchase>, String> {
     with_session(&state, |conn| simple::list_purchases(conn))
 }
@@ -465,6 +491,10 @@ pub fn run() {
             get_invoice,
             save_invoice,
             delete_invoice,
+            list_recurring_invoices,
+            save_recurring_invoice,
+            delete_recurring_invoice,
+            generate_due_invoices,
             list_purchases,
             save_purchase,
             delete_purchase,
@@ -476,7 +506,7 @@ pub fn run() {
             balance_sheet,
             tax_summary,
             list_settings,
-            save_setting
+            save_setting,
         ])
         .run(tauri::generate_context!())
         .expect("error while running LedgerWorks");

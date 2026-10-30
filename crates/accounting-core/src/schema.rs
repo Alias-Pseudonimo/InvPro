@@ -1,7 +1,7 @@
 //! Company file schema. Each company lives in its own SQLite file, so the
 //! schema is per-file and migrations are tracked with `PRAGMA user_version`.
 
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// Everything a company file needs, including the invariants that must hold
 /// even if a future UI (or a hand-written SQL session) bypasses this crate.
@@ -350,6 +350,27 @@ const AUDITED_TABLES: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// Schema v3 — an income record and its invoice become one story, and a
+/// recurring invoice becomes a schedule that can produce real documents.
+pub fn migration_3() -> String {
+    let mut sql = String::from(MIGRATION_3_DDL);
+    for (table, columns) in RECURRING_AUDITED {
+        sql.push_str(&audit_triggers(table, columns));
+    }
+    sql
+}
+
+const RECURRING_AUDITED: &[(&str, &[&str])] = &[
+    (
+        "recurring_invoices",
+        &["id", "customer_id", "description", "frequency", "start_date", "next_date", "end_date", "tax_bp", "is_active"],
+    ),
+    (
+        "recurring_invoice_lines",
+        &["id", "recurring_id", "position", "description", "qty_hundredths", "unit_price_cents", "inventory_item_id"],
+    ),
+];
+
 fn audit_triggers(table: &str, columns: &[&str]) -> String {
     let after = json_image(columns, "NEW");
     let before = json_image(columns, "OLD");
@@ -537,4 +558,42 @@ CREATE TABLE payroll_runs (
 INSERT INTO settings (key, value) VALUES ('currency', 'USD');
 INSERT INTO settings (key, value) VALUES ('invoice_income_account', 'Sales Revenue');
 INSERT INTO settings (key, value) VALUES ('invoice_tax_bp', '0');
+"#;
+
+
+
+const MIGRATION_3_DDL: &str = r#"
+-- An income record either owns the invoice it created or settles one that was
+-- already there. Either way the money is booked once, on the invoice.
+ALTER TABLE income_records ADD COLUMN invoice_id   INTEGER REFERENCES invoices(id) ON DELETE SET NULL;
+ALTER TABLE income_records ADD COLUMN invoice_auto INTEGER NOT NULL DEFAULT 0 CHECK (invoice_auto IN (0, 1));
+
+CREATE INDEX idx_income_invoice ON income_records(invoice_id);
+
+CREATE TABLE recurring_invoices (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+    description TEXT    NOT NULL DEFAULT '',
+    frequency   TEXT    NOT NULL DEFAULT 'Monthly'
+                        CHECK (frequency IN ('Weekly', 'Monthly', 'Quarterly', 'Yearly')),
+    start_date  TEXT    NOT NULL CHECK (start_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+    next_date   TEXT    NOT NULL CHECK (next_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+    end_date    TEXT    CHECK (end_date IS NULL OR end_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+    tax_bp      INTEGER NOT NULL DEFAULT 0 CHECK (tax_bp BETWEEN 0 AND 10000),
+    is_active   INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+    created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX idx_recurring_next ON recurring_invoices(next_date);
+
+CREATE TABLE recurring_invoice_lines (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    recurring_id      INTEGER NOT NULL REFERENCES recurring_invoices(id) ON DELETE CASCADE,
+    position          INTEGER NOT NULL CHECK (position > 0),
+    description       TEXT    NOT NULL DEFAULT '',
+    qty_hundredths    INTEGER NOT NULL DEFAULT 100 CHECK (qty_hundredths > 0),
+    unit_price_cents  INTEGER NOT NULL DEFAULT 0 CHECK (unit_price_cents >= 0),
+    inventory_item_id INTEGER REFERENCES inventory_items(id) ON DELETE SET NULL,
+    UNIQUE (recurring_id, position)
+);
 "#;

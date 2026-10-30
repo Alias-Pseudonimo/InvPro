@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::accounts::{self, AccountInput, AccountType};
 use crate::journal::{self, EntrySource, JournalEntryInput, JournalLineInput};
-use crate::{audit, money, CoreError, Result};
+use crate::{audit, dates, money, CoreError, Result};
 
 // ---------------------------------------------------------------------------
 // Account roles. Stored in `settings` as account ids.
@@ -352,6 +352,34 @@ fn category_account(
         },
     )?;
     Ok((created.id, name))
+}
+
+/// Every account an invoice touches, resolved once *before* the transaction that
+/// writes the invoice. Finding or creating an account can itself need a write,
+/// and only one transaction can own the connection at a time.
+#[derive(Clone, Copy)]
+struct InvoiceAccounts {
+    cash: i64,
+    receivable: i64,
+    tax: i64,
+    inventory: i64,
+    cogs: i64,
+    income: i64,
+}
+
+fn invoice_accounts(conn: &mut Connection) -> Result<InvoiceAccounts> {
+    let income_name = setting(conn, "invoice_income_account")?
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "Sales Revenue".to_string());
+    let (income, _) = category_account(conn, &income_name, AccountType::Income)?;
+    Ok(InvoiceAccounts {
+        cash: cash_account(conn)?,
+        receivable: receivable_account(conn)?,
+        tax: tax_account(conn)?,
+        inventory: inventory_account(conn)?,
+        cogs: cogs_account(conn)?,
+        income,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -855,6 +883,7 @@ pub struct IncomeRecord {
     pub total_cents: i64,
     pub is_paid: bool,
     pub invoice_no: String,
+    pub invoice_id: Option<i64>,
     pub journal_entry_id: Option<i64>,
 }
 
@@ -862,7 +891,7 @@ const SELECT_INCOME: &str = r#"
 SELECT i.id, i.entry_date, i.customer_id, COALESCE(c.name, ''),
        i.category, i.description, i.amount_cents, i.tax_bp,
        (i.amount_cents * i.tax_bp + 5000) / 10000,
-       i.is_paid, i.invoice_no, i.journal_entry_id
+       i.is_paid, i.invoice_no, i.journal_entry_id, i.invoice_id
 FROM income_records i
 LEFT JOIN customers c ON c.id = i.customer_id
 "#;
@@ -884,6 +913,7 @@ fn map_income(row: &rusqlite::Row<'_>) -> rusqlite::Result<IncomeRecord> {
         is_paid: row.get::<_, i64>(9)? != 0,
         invoice_no: row.get(10)?,
         journal_entry_id: row.get(11)?,
+        invoice_id: row.get(12)?,
     })
 }
 
@@ -902,6 +932,93 @@ pub fn income_by_id(conn: &Connection, id: i64) -> Result<IncomeRecord> {
         .ok_or_else(|| CoreError::not_found(format!("income record {id} does not exist")))
 }
 
+// ---------------------------------------------------------------------------
+// Income, and the invoice it belongs to
+// ---------------------------------------------------------------------------
+
+/// One invoice, reduced to what an income record needs to know about it.
+#[derive(Clone)]
+struct IncomeInvoice {
+    id: i64,
+    invoice_no: String,
+    status: String,
+    total_cents: i64,
+    cash_entry_id: Option<i64>,
+}
+
+fn income_invoice_by_number(conn: &Connection, number: &str) -> Result<Option<IncomeInvoice>> {
+    Ok(conn
+        .prepare(
+        "SELECT i.id, i.invoice_no, i.status, i.tax_bp, i.cash_entry_id,
+                COALESCE((SELECT SUM((l.qty_hundredths * l.unit_price_cents + 50) / 100)
+                            FROM invoice_lines l WHERE l.invoice_id = i.id), 0)
+           FROM invoices i
+          WHERE lower(trim(i.invoice_no)) = lower(trim(?1))",
+    )?
+    .query_row([number], |row| {
+        let tax_bp: i64 = row.get(3)?;
+        let subtotal: i64 = row.get(5)?;
+        Ok(IncomeInvoice {
+            id: row.get(0)?,
+            invoice_no: row.get(1)?,
+            status: row.get(2)?,
+            total_cents: subtotal + tax_of(subtotal, tax_bp),
+            cash_entry_id: row.get(4)?,
+        })
+        })
+        .optional()?)
+}
+
+/// What recording this income should do about an invoice.
+enum IncomeInvoicePlan {
+    /// No invoice number was given: a plain income record.
+    Plain,
+    /// Rewrite the invoice this income record already created.
+    Own { id: i64 },
+    /// Settle an invoice that was already there.
+    Settle(IncomeInvoice),
+    /// Create the invoice, reusing the row this record already owns if it has one.
+    Create { reuse: Option<i64> },
+}
+
+/// Build the invoice an income record creates: one line for the amount, dated
+/// the day the money was earned, already sent (or paid) because the income says
+/// whether it has arrived.
+fn invoice_from_income(input: &IncomeInput, number: &str, id: Option<i64>) -> InvoiceInput {
+    let description = match input.description.trim() {
+        "" => input.category.trim().to_string(),
+        text => text.to_string(),
+    };
+    InvoiceInput {
+        id,
+        invoice_no: Some(number.to_string()),
+        customer_id: input.customer_id,
+        invoice_date: input.entry_date.clone(),
+        due_date: None,
+        status: if input.is_paid { "Paid" } else { "Sent" }.to_string(),
+        tax_bp: input.tax_bp,
+        lines: vec![InvoiceLineInput {
+            description,
+            qty_hundredths: 100,
+            unit_price_cents: input.amount_cents,
+            inventory_item_id: None,
+        }],
+    }
+}
+
+/// Undo the payment an income record put against somebody else's invoice, so the
+/// invoice goes back to owing money instead of pointing at a voided entry.
+fn release_invoice_payment(conn: &Connection, invoice_id: i64, entry_id: Option<i64>) -> Result<()> {
+    if let Some(entry_id) = entry_id {
+        conn.execute(
+            "UPDATE invoices SET status = 'Sent', cash_entry_id = NULL
+              WHERE id = ?1 AND cash_entry_id = ?2",
+            params![invoice_id, entry_id],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn save_income(conn: &mut Connection, input: &IncomeInput) -> Result<IncomeRecord> {
     let day = checked_date(&input.entry_date, "the date")?;
     if input.amount_cents <= 0 {
@@ -909,6 +1026,7 @@ pub fn save_income(conn: &mut Connection, input: &IncomeInput) -> Result<IncomeR
     }
     let tax_bp = checked_tax_rate(input.tax_bp)?;
     let category = required_text(&input.category, "a category")?;
+    let number = input.invoice_no.trim().to_string();
 
     let (category_id, _) = category_account(conn, &category, AccountType::Income)?;
     let cash = cash_account(conn)?;
@@ -917,44 +1035,158 @@ pub fn save_income(conn: &mut Connection, input: &IncomeInput) -> Result<IncomeR
     let tax = tax_of(input.amount_cents, tax_bp);
     let total = input.amount_cents + tax;
 
-    let mut lines = vec![line(
-        if input.is_paid { cash } else { receivable },
-        total,
-        0,
-    )];
-    lines.push(line(category_id, 0, input.amount_cents));
-    if tax > 0 {
-        lines.push(line(tax_account_id, 0, tax));
-    }
-
-    let memo = match input.description.trim() {
-        "" => category.clone(),
-        text => format!("{category} — {text}"),
-    };
-    let entry = JournalEntryInput {
-        entry_date: day.clone(),
-        memo,
-        reference: Some(input.invoice_no.trim().to_string()).filter(|value| !value.is_empty()),
-        source: EntrySource::Payment,
-        lines,
+    // Resolved before the transaction opens: creating one of these accounts may
+    // need a write of its own, and the caller owns the transaction from here on.
+    let invoice_books = if number.is_empty() {
+        None
+    } else {
+        Some(invoice_accounts(conn)?)
     };
 
     let tx = conn.transaction()?;
-    if let Some(id) = input.id {
-        let previous: Option<Option<i64>> = tx
+
+    // What this record did last time, so an edit reverses exactly that.
+    let (previous_entry, previous_invoice, previous_auto) = match input.id {
+        Some(id) => tx
             .query_row(
-                "SELECT journal_entry_id FROM income_records WHERE id = ?1",
+                "SELECT journal_entry_id, invoice_id, invoice_auto
+                   FROM income_records WHERE id = ?1",
                 [id],
-                |row| row.get(0),
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                },
             )
-            .optional()?;
-        match previous {
-            None => return Err(CoreError::not_found(format!("income record {id} does not exist"))),
-            Some(entry_id) => {
-                if let Some(entry_id) = entry_id {
-                    journal::void_in(&tx, entry_id)?;
+            .optional()?
+            .ok_or_else(|| CoreError::not_found(format!("income record {id} does not exist")))?,
+        None => (None, None, false),
+    };
+    let own_invoice = if previous_auto { previous_invoice } else { None };
+
+    let existing = if number.is_empty() {
+        None
+    } else {
+        income_invoice_by_number(&tx, &number)?
+    };
+
+    // An invoice number on an income record means that invoice, and only that
+    // invoice: it is either created from this record, rewritten by it, or
+    // settled by it. Never a second copy of the same sale.
+    let plan = match existing.as_ref() {
+        None if number.is_empty() => IncomeInvoicePlan::Plain,
+        None => IncomeInvoicePlan::Create { reuse: own_invoice },
+        Some(invoice) if Some(invoice.id) == own_invoice => IncomeInvoicePlan::Own { id: invoice.id },
+        Some(invoice) if invoice.status == "Draft" => {
+            return Err(CoreError::validation(format!(
+                "invoice {number} is still a draft — send it first, or record this income without the invoice number"
+            )));
+        }
+        Some(invoice) if invoice.status == "Paid" => {
+            return Err(CoreError::validation(format!(
+                "invoice {number} is already paid; this income would be counted twice"
+            )));
+        }
+        Some(invoice) => IncomeInvoicePlan::Settle(invoice.clone()),
+    };
+
+    // The invoice's own spelling wins, so a lower-case entry does not create a
+    // second-looking number alongside the invoice it settles.
+    let mut stored_number = number.clone();
+    if let IncomeInvoicePlan::Settle(invoice) = &plan {
+        stored_number = invoice.invoice_no.clone();
+    }
+
+    if let Some(invoice_id) = previous_invoice {
+        let keeping = match &plan {
+            IncomeInvoicePlan::Own { id } => *id == invoice_id,
+            IncomeInvoicePlan::Create { reuse } => *reuse == Some(invoice_id),
+            _ => false,
+        };
+        if previous_auto && !keeping {
+            // The record no longer stands for that invoice, so the invoice it
+            // created goes with it rather than lingering as a ghost sale.
+            delete_invoice_tx(&tx, invoice_id)?;
+        } else if !previous_auto {
+            release_invoice_payment(&tx, invoice_id, previous_entry)?;
+        }
+    }
+    if let Some(entry_id) = previous_entry {
+        journal::void_in(&tx, entry_id)?;
+    }
+
+    let mut invoice_id: Option<i64> = None;
+    let mut invoice_auto = false;
+    let mut journal_entry_id: Option<i64> = None;
+
+    match plan {
+        IncomeInvoicePlan::Own { id } => {
+            // The invoice this record created follows the edit, number included.
+            let books = invoice_books
+                .as_ref()
+                .expect("an invoice plan resolves its accounts first");
+            save_invoice_tx(&tx, books, &invoice_from_income(input, &number, Some(id)))?;
+            invoice_id = Some(id);
+            invoice_auto = true;
+        }
+        IncomeInvoicePlan::Create { reuse } => {
+            let books = invoice_books
+                .as_ref()
+                .expect("an invoice plan resolves its accounts first");
+            let id = save_invoice_tx(&tx, books, &invoice_from_income(input, &number, reuse))?;
+            invoice_id = Some(id);
+            invoice_auto = true;
+        }
+        IncomeInvoicePlan::Settle(invoice) => {
+            if input.is_paid {
+                if invoice.cash_entry_id.is_some() {
+                    return Err(CoreError::validation(format!(
+                        "invoice {number} already has a payment recorded against it"
+                    )));
                 }
+                // The invoice already booked the revenue and the receivable, so
+                // this income is only the cash arriving.
+                let entry = JournalEntryInput {
+                    entry_date: day.clone(),
+                    memo: format!("Payment received — invoice {stored_number}"),
+                    reference: Some(stored_number.clone()),
+                    source: EntrySource::Payment,
+                    lines: vec![line(cash, total, 0), line(receivable, 0, total)],
+                };
+                let posted = journal::post_in(&tx, &entry)?;
+                journal_entry_id = Some(posted.summary.id);
+                let fully_paid = total >= invoice.total_cents;
+                tx.execute(
+                    "UPDATE invoices SET cash_entry_id = ?2, status = ?3 WHERE id = ?1",
+                    params![
+                        invoice.id,
+                        journal_entry_id,
+                        if fully_paid { "Paid" } else { "Sent" }
+                    ],
+                )?;
             }
+            invoice_id = Some(invoice.id);
+        }
+        IncomeInvoicePlan::Plain => {
+            let mut lines = vec![line(if input.is_paid { cash } else { receivable }, total, 0)];
+            lines.push(line(category_id, 0, input.amount_cents));
+            if tax > 0 {
+                lines.push(line(tax_account_id, 0, tax));
+            }
+            let memo = match input.description.trim() {
+                "" => category.clone(),
+                text => format!("{category} — {text}"),
+            };
+            let entry = JournalEntryInput {
+                entry_date: day.clone(),
+                memo,
+                reference: None,
+                source: EntrySource::Payment,
+                lines,
+            };
+            journal_entry_id = Some(journal::post_in(&tx, &entry)?.summary.id);
         }
     }
 
@@ -964,7 +1196,8 @@ pub fn save_income(conn: &mut Connection, input: &IncomeInput) -> Result<IncomeR
                 "UPDATE income_records
                     SET entry_date = ?2, customer_id = ?3, category = ?4, account_id = ?5,
                         description = ?6, amount_cents = ?7, tax_bp = ?8, is_paid = ?9,
-                        invoice_no = ?10, journal_entry_id = NULL
+                        invoice_no = ?10, invoice_id = ?11, invoice_auto = ?12,
+                        journal_entry_id = ?13
                   WHERE id = ?1",
                 params![
                     id,
@@ -976,7 +1209,10 @@ pub fn save_income(conn: &mut Connection, input: &IncomeInput) -> Result<IncomeR
                     input.amount_cents,
                     tax_bp,
                     input.is_paid as i64,
-                    input.invoice_no.trim()
+                    stored_number,
+                    invoice_id,
+                    invoice_auto as i64,
+                    journal_entry_id
                 ],
             )?;
             id
@@ -985,8 +1221,9 @@ pub fn save_income(conn: &mut Connection, input: &IncomeInput) -> Result<IncomeR
             tx.execute(
                 "INSERT INTO income_records
                     (entry_date, customer_id, category, account_id, description,
-                     amount_cents, tax_bp, is_paid, invoice_no)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     amount_cents, tax_bp, is_paid, invoice_no, invoice_id, invoice_auto,
+                     journal_entry_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     day,
                     input.customer_id,
@@ -996,33 +1233,46 @@ pub fn save_income(conn: &mut Connection, input: &IncomeInput) -> Result<IncomeR
                     input.amount_cents,
                     tax_bp,
                     input.is_paid as i64,
-                    input.invoice_no.trim()
+                    stored_number,
+                    invoice_id,
+                    invoice_auto as i64,
+                    journal_entry_id
                 ],
             )?;
             tx.last_insert_rowid()
         }
     };
 
-    let posted = journal::post_in(&tx, &entry)?;
-    tx.execute(
-        "UPDATE income_records SET journal_entry_id = ?2 WHERE id = ?1",
-        params![id, posted.summary.id],
-    )?;
     audit::seal_pending(&tx)?;
     tx.commit()?;
     income_by_id(conn, id)
 }
 
 pub fn delete_income(conn: &mut Connection, id: i64) -> Result<()> {
-    let entry_id: Option<i64> = conn
+    let (entry_id, invoice_id, invoice_auto) = conn
         .query_row(
-            "SELECT journal_entry_id FROM income_records WHERE id = ?1",
+            "SELECT journal_entry_id, invoice_id, invoice_auto
+               FROM income_records WHERE id = ?1",
             [id],
-            |row| row.get(0),
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                ))
+            },
         )
         .optional()?
         .ok_or_else(|| CoreError::not_found(format!("income record {id} does not exist")))?;
     let tx = conn.transaction()?;
+    if let Some(invoice_id) = invoice_id {
+        if invoice_auto {
+            // The invoice only existed because of this record.
+            delete_invoice_tx(&tx, invoice_id)?;
+        } else {
+            release_invoice_payment(&tx, invoice_id, entry_id)?;
+        }
+    }
     if let Some(entry_id) = entry_id {
         journal::void_in(&tx, entry_id)?;
     }
@@ -1031,6 +1281,7 @@ pub fn delete_income(conn: &mut Connection, id: i64) -> Result<()> {
     tx.commit()?;
     Ok(())
 }
+
 
 // ---------------------------------------------------------------------------
 // Expenses
@@ -1314,8 +1565,15 @@ fn normalized_status(status: &str) -> Result<&'static str> {
     }
 }
 
+/// The next free number. It looks at the invoice list *and* at numbers already
+/// written on income records, so an automatic number can never collide with a
+/// number the owner typed.
 fn next_invoice_number(conn: &Connection) -> Result<String> {
-    let mut stmt = conn.prepare("SELECT invoice_no FROM invoices")?;
+    let mut stmt = conn.prepare(
+        "SELECT invoice_no FROM invoices
+         UNION ALL
+         SELECT invoice_no FROM income_records WHERE trim(invoice_no) <> ''",
+    )?;
     let numbers = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut highest = 1000i64;
     for number in numbers {
@@ -1409,6 +1667,31 @@ pub fn get_invoice(conn: &Connection, id: i64) -> Result<Invoice> {
 }
 
 pub fn save_invoice(conn: &mut Connection, input: &InvoiceInput) -> Result<Invoice> {
+    let accounts = invoice_accounts(conn)?;
+    let tx = conn.transaction()?;
+    let id = save_invoice_tx(&tx, &accounts, input)?;
+    audit::seal_pending(&tx)?;
+    tx.commit()?;
+    invoice_by_id(conn, id)
+}
+
+/// Save an invoice inside a transaction the caller already owns, and return its
+/// id. The caller seals and commits, so an income record and the invoice it
+/// creates land in the file together or not at all.
+fn save_invoice_tx(
+    conn: &Connection,
+    accounts: &InvoiceAccounts,
+    input: &InvoiceInput,
+) -> Result<i64> {
+    // No transaction of its own: the caller owns the transaction.
+    let InvoiceAccounts {
+        cash,
+        receivable,
+        tax: tax_account_id,
+        inventory,
+        cogs,
+        income: income_id,
+    } = *accounts;
     let day = checked_date(&input.invoice_date, "the invoice date")?;
     let due = match input.due_date.as_deref() {
         Some(value) if !value.trim().is_empty() => Some(checked_date(value, "the due date")?),
@@ -1417,31 +1700,7 @@ pub fn save_invoice(conn: &mut Connection, input: &InvoiceInput) -> Result<Invoi
     let status = normalized_status(&input.status)?;
     let tax_bp = checked_tax_rate(input.tax_bp)?;
 
-    let mut lines: Vec<InvoiceLineInput> = Vec::new();
-    for (index, line) in input.lines.iter().enumerate() {
-        let position = index + 1;
-        let is_blank = line.description.trim().is_empty()
-            && line.unit_price_cents == 0
-            && line.qty_hundredths == 100
-            && line.inventory_item_id.is_none();
-        if is_blank {
-            continue;
-        }
-        if line.qty_hundredths <= 0 {
-            return Err(CoreError::validation(format!(
-                "line {position}: the quantity must be greater than zero"
-            )));
-        }
-        if line.unit_price_cents < 0 {
-            return Err(CoreError::validation(format!(
-                "line {position}: the price cannot be negative"
-            )));
-        }
-        lines.push(line.clone());
-    }
-    if lines.is_empty() {
-        return Err(CoreError::validation("add at least one line to the invoice"));
-    }
+    let lines = checked_lines(&input.lines)?;
 
     let subtotal: i64 = lines
         .iter()
@@ -1453,22 +1712,13 @@ pub fn save_invoice(conn: &mut Connection, input: &InvoiceInput) -> Result<Invoi
         return Err(CoreError::validation("an invoice must be worth more than zero"));
     }
 
-    let cash = cash_account(conn)?;
-    let receivable = receivable_account(conn)?;
-    let tax_account_id = tax_account(conn)?;
-    let inventory = inventory_account(conn)?;
-    let cogs = cogs_account(conn)?;
-    let income_name = setting(conn, "invoice_income_account")?
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "Sales Revenue".to_string());
-    let (income_id, _) = category_account(conn, &income_name, AccountType::Income)?;
-
     let invoice_no = match input.invoice_no.as_deref() {
         Some(value) if !value.trim().is_empty() => {
             let value = value.trim().to_string();
             let clash: Option<i64> = conn
                 .query_row(
-                    "SELECT id FROM invoices WHERE invoice_no = ?1 AND id IS NOT ?2",
+                    "SELECT id FROM invoices
+                      WHERE lower(trim(invoice_no)) = lower(trim(?1)) AND id IS NOT ?2",
                     params![value, input.id],
                     |row| row.get(0),
                 )
@@ -1511,23 +1761,22 @@ pub fn save_invoice(conn: &mut Connection, input: &InvoiceInput) -> Result<Invoi
         None => Vec::new(),
     };
 
-    let tx = conn.transaction()?;
     if let Some((stock_deducted, ar, cash_entry, cogs_entry)) = &previous {
         if *stock_deducted {
             for line in &previous_lines {
                 if let Some(item_id) = line.inventory_item_id {
-                    adjust_stock(&tx, item_id, line.qty_hundredths)?;
+                    adjust_stock(conn, item_id, line.qty_hundredths)?;
                 }
             }
         }
         for entry in [*ar, *cash_entry, *cogs_entry].into_iter().flatten() {
-            journal::void_in(&tx, entry)?;
+            journal::void_in(conn, entry)?;
         }
     }
 
     let id = match input.id {
         Some(id) => {
-            tx.execute(
+            conn.execute(
                 "UPDATE invoices
                     SET invoice_no = ?2, customer_id = ?3, invoice_date = ?4, due_date = ?5,
                         status = ?6, tax_bp = ?7, stock_deducted = 0,
@@ -1535,21 +1784,21 @@ pub fn save_invoice(conn: &mut Connection, input: &InvoiceInput) -> Result<Invoi
                   WHERE id = ?1",
                 params![id, invoice_no, input.customer_id, day, due, status, tax_bp],
             )?;
-            tx.execute("DELETE FROM invoice_lines WHERE invoice_id = ?1", [id])?;
+            conn.execute("DELETE FROM invoice_lines WHERE invoice_id = ?1", [id])?;
             id
         }
         None => {
-            tx.execute(
+            conn.execute(
                 "INSERT INTO invoices (invoice_no, customer_id, invoice_date, due_date, status, tax_bp)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![invoice_no, input.customer_id, day, due, status, tax_bp],
             )?;
-            tx.last_insert_rowid()
+            conn.last_insert_rowid()
         }
     };
 
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = conn.prepare(
             "INSERT INTO invoice_lines
                 (invoice_id, position, description, qty_hundredths, unit_price_cents, inventory_item_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1586,14 +1835,14 @@ pub fn save_invoice(conn: &mut Connection, input: &InvoiceInput) -> Result<Invoi
             source: EntrySource::Invoice,
             lines: entry_lines,
         };
-        ar_entry_id = Some(journal::post_in(&tx, &entry)?.summary.id);
+        ar_entry_id = Some(journal::post_in(conn, &entry)?.summary.id);
 
         let mut cogs_total = 0i64;
         for line in &lines {
             if let Some(item_id) = line.inventory_item_id {
-                adjust_stock(&tx, item_id, -line.qty_hundredths)?;
+                adjust_stock(conn, item_id, -line.qty_hundredths)?;
                 stock_deducted = true;
-                cogs_total += line_total(line.qty_hundredths, item_cost(&tx, item_id)?);
+                cogs_total += line_total(line.qty_hundredths, item_cost(conn, item_id)?);
             }
         }
         if cogs_total > 0 {
@@ -1604,7 +1853,7 @@ pub fn save_invoice(conn: &mut Connection, input: &InvoiceInput) -> Result<Invoi
                 source: EntrySource::Inventory,
                 lines: vec![line(cogs, cogs_total, 0), line(inventory, 0, cogs_total)],
             };
-            cogs_entry_id = Some(journal::post_in(&tx, &entry)?.summary.id);
+            cogs_entry_id = Some(journal::post_in(conn, &entry)?.summary.id);
         }
     }
 
@@ -1616,10 +1865,10 @@ pub fn save_invoice(conn: &mut Connection, input: &InvoiceInput) -> Result<Invoi
             source: EntrySource::Payment,
             lines: vec![line(cash, total, 0), line(receivable, 0, total)],
         };
-        cash_entry_id = Some(journal::post_in(&tx, &entry)?.summary.id);
+        cash_entry_id = Some(journal::post_in(conn, &entry)?.summary.id);
     }
 
-    tx.execute(
+    conn.execute(
         "UPDATE invoices
             SET stock_deducted = ?2, ar_entry_id = ?3, cash_entry_id = ?4, cogs_entry_id = ?5
           WHERE id = ?1",
@@ -1631,13 +1880,21 @@ pub fn save_invoice(conn: &mut Connection, input: &InvoiceInput) -> Result<Invoi
             cogs_entry_id
         ],
     )?;
-    audit::seal_pending(&tx)?;
-    tx.commit()?;
-    invoice_by_id(conn, id)
+    Ok(id)
 }
 
 pub fn delete_invoice(conn: &mut Connection, id: i64) -> Result<()> {
-    let row = conn
+    let tx = conn.transaction()?;
+    delete_invoice_tx(&tx, id)?;
+    audit::seal_pending(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Remove an invoice and everything it booked, inside a transaction the caller
+/// already owns. Used when the income record that created it goes away.
+fn delete_invoice_tx(conn: &Connection, id: i64) -> Result<()> {
+        let row = conn
         .query_row(
             "SELECT stock_deducted, ar_entry_id, cash_entry_id, cogs_entry_id
                FROM invoices WHERE id = ?1",
@@ -1655,22 +1912,390 @@ pub fn delete_invoice(conn: &mut Connection, id: i64) -> Result<()> {
         .ok_or_else(|| CoreError::not_found(format!("invoice {id} does not exist")))?;
     let lines = invoice_lines_of(conn, id)?;
 
-    let tx = conn.transaction()?;
     if row.0 {
         for line in &lines {
             if let Some(item_id) = line.inventory_item_id {
-                adjust_stock(&tx, item_id, line.qty_hundredths)?;
+                adjust_stock(conn, item_id, line.qty_hundredths)?;
             }
         }
     }
     for entry in [row.1, row.2, row.3].into_iter().flatten() {
-        journal::void_in(&tx, entry)?;
+        journal::void_in(conn, entry)?;
     }
-    tx.execute("DELETE FROM invoice_lines WHERE invoice_id = ?1", [id])?;
-    tx.execute("DELETE FROM invoices WHERE id = ?1", [id])?;
+    conn.execute("DELETE FROM invoice_lines WHERE invoice_id = ?1", [id])?;
+    conn.execute("DELETE FROM invoices WHERE id = ?1", [id])?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Recurring invoices
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecurringInvoiceInput {
+    pub id: Option<i64>,
+    pub customer_id: Option<i64>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "monthly_frequency")]
+    pub frequency: String,
+    pub start_date: String,
+    pub end_date: Option<String>,
+    #[serde(default)]
+    pub tax_bp: i64,
+    #[serde(default = "active_by_default")]
+    pub is_active: bool,
+    pub lines: Vec<InvoiceLineInput>,
+}
+
+fn monthly_frequency() -> String {
+    "Monthly".to_string()
+}
+
+fn active_by_default() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecurringInvoice {
+    pub id: i64,
+    pub customer_id: Option<i64>,
+    pub customer_name: String,
+    pub description: String,
+    pub frequency: String,
+    pub start_date: String,
+    pub next_date: String,
+    pub end_date: Option<String>,
+    pub tax_bp: i64,
+    pub is_active: bool,
+    pub subtotal_cents: i64,
+    pub total_cents: i64,
+    pub lines: Vec<InvoiceLine>,
+}
+
+fn normalized_frequency(value: &str) -> Result<&'static str> {
+    match value.trim() {
+        "" | "Monthly" => Ok("Monthly"),
+        "Weekly" => Ok("Weekly"),
+        "Quarterly" => Ok("Quarterly"),
+        "Yearly" => Ok("Yearly"),
+        other => Err(CoreError::validation(format!(
+            "'{other}' is not a schedule; use Weekly, Monthly, Quarterly or Yearly"
+        ))),
+    }
+}
+
+fn next_occurrence(date: &str, frequency: &str) -> String {
+    match frequency {
+        "Weekly" => dates::add_days(date, 7),
+        "Quarterly" => dates::add_months(date, 3),
+        "Yearly" => dates::add_months(date, 12),
+        _ => dates::add_months(date, 1),
+    }
+}
+
+/// The line rules an invoice and a schedule share: blank rows are dropped and
+/// what is left has to make sense.
+fn checked_lines(lines: &[InvoiceLineInput]) -> Result<Vec<InvoiceLineInput>> {
+    let mut checked = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let position = index + 1;
+        let is_blank = line.description.trim().is_empty()
+            && line.unit_price_cents == 0
+            && line.qty_hundredths == 100
+            && line.inventory_item_id.is_none();
+        if is_blank {
+            continue;
+        }
+        if line.qty_hundredths <= 0 {
+            return Err(CoreError::validation(format!(
+                "line {position}: the quantity must be greater than zero"
+            )));
+        }
+        if line.unit_price_cents < 0 {
+            return Err(CoreError::validation(format!(
+                "line {position}: the price cannot be negative"
+            )));
+        }
+        checked.push(line.clone());
+    }
+    if checked.is_empty() {
+        return Err(CoreError::validation("add at least one line to the invoice"));
+    }
+    Ok(checked)
+}
+
+fn recurring_lines_of(conn: &Connection, recurring_id: i64) -> Result<Vec<InvoiceLine>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, position, description, qty_hundredths, unit_price_cents, inventory_item_id
+           FROM recurring_invoice_lines WHERE recurring_id = ?1 ORDER BY position",
+    )?;
+    let rows = stmt.query_map([recurring_id], |row| {
+        let qty: i64 = row.get(3)?;
+        let price: i64 = row.get(4)?;
+        Ok(InvoiceLine {
+            id: row.get(0)?,
+            position: row.get(1)?,
+            description: row.get(2)?,
+            qty_hundredths: qty,
+            unit_price_cents: price,
+            amount_cents: line_total(qty, price),
+            inventory_item_id: row.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn recurring_by_id(conn: &Connection, id: i64) -> Result<RecurringInvoice> {
+    let mut invoice: RecurringInvoice = conn
+        .prepare(
+            "SELECT r.id, r.customer_id, COALESCE(c.name, ''), r.description, r.frequency,
+                    r.start_date, r.next_date, r.end_date, r.tax_bp, r.is_active
+               FROM recurring_invoices r
+               LEFT JOIN customers c ON c.id = r.customer_id
+              WHERE r.id = ?1",
+        )?
+        .query_row([id], |row| {
+            Ok(RecurringInvoice {
+                id: row.get(0)?,
+                customer_id: row.get(1)?,
+                customer_name: row.get(2)?,
+                description: row.get(3)?,
+                frequency: row.get(4)?,
+                start_date: row.get(5)?,
+                next_date: row.get(6)?,
+                end_date: row.get(7)?,
+                tax_bp: row.get(8)?,
+                is_active: row.get::<_, i64>(9)? != 0,
+                subtotal_cents: 0,
+                total_cents: 0,
+                lines: Vec::new(),
+            })
+        })
+        .optional()?
+        .ok_or_else(|| CoreError::not_found(format!("recurring invoice {id} does not exist")))?;
+    invoice.lines = recurring_lines_of(conn, id)?;
+    invoice.subtotal_cents = invoice.lines.iter().map(|line| line.amount_cents).sum();
+    invoice.total_cents = invoice.subtotal_cents + tax_of(invoice.subtotal_cents, invoice.tax_bp);
+    Ok(invoice)
+}
+
+pub fn list_recurring_invoices(conn: &Connection) -> Result<Vec<RecurringInvoice>> {
+    let mut ids = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM recurring_invoices ORDER BY is_active DESC, next_date, id",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        for id in rows {
+            ids.push(id?);
+        }
+    }
+    ids.into_iter().map(|id| recurring_by_id(conn, id)).collect()
+}
+
+pub fn get_recurring_invoice(conn: &Connection, id: i64) -> Result<RecurringInvoice> {
+    recurring_by_id(conn, id)
+}
+
+pub fn save_recurring_invoice(
+    conn: &mut Connection,
+    input: &RecurringInvoiceInput,
+) -> Result<RecurringInvoice> {
+    let start = checked_date(&input.start_date, "the start date")?;
+    let end = match input.end_date.as_deref() {
+        Some(value) if !value.trim().is_empty() => Some(checked_date(value, "the end date")?),
+        _ => None,
+    };
+    if let Some(end) = &end {
+        if end.as_str() < start.as_str() {
+            return Err(CoreError::validation(
+                "the end date cannot be before the start date",
+            ));
+        }
+    }
+    let frequency = normalized_frequency(&input.frequency)?;
+    let tax_bp = checked_tax_rate(input.tax_bp)?;
+    let lines = checked_lines(&input.lines)?;
+    let description = input.description.trim().to_string();
+
+    let tx = conn.transaction()?;
+    let id = match input.id {
+        Some(id) => {
+            let next: Option<String> = tx
+                .query_row(
+                    "SELECT next_date FROM recurring_invoices WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let next = next.ok_or_else(|| {
+                CoreError::not_found(format!("recurring invoice {id} does not exist"))
+            })?;
+            // A schedule that already ran keeps its place; a new start date moves it.
+            let next = if next.as_str() < start.as_str() { start.clone() } else { next };
+            tx.execute(
+                "UPDATE recurring_invoices
+                    SET customer_id = ?2, description = ?3, frequency = ?4, start_date = ?5,
+                        next_date = ?6, end_date = ?7, tax_bp = ?8, is_active = ?9
+                  WHERE id = ?1",
+                params![
+                    id,
+                    input.customer_id,
+                    description,
+                    frequency,
+                    start,
+                    next,
+                    end,
+                    tax_bp,
+                    input.is_active as i64
+                ],
+            )?;
+            id
+        }
+        None => {
+            tx.execute(
+                "INSERT INTO recurring_invoices
+                    (customer_id, description, frequency, start_date, next_date, end_date,
+                     tax_bp, is_active)
+                 VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7)",
+                params![
+                    input.customer_id,
+                    description,
+                    frequency,
+                    start,
+                    end,
+                    tax_bp,
+                    input.is_active as i64
+                ],
+            )?;
+            tx.last_insert_rowid()
+        }
+    };
+
+    tx.execute(
+        "DELETE FROM recurring_invoice_lines WHERE recurring_id = ?1",
+        [id],
+    )?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO recurring_invoice_lines
+                (recurring_id, position, description, qty_hundredths, unit_price_cents,
+                 inventory_item_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for (index, line) in lines.iter().enumerate() {
+            stmt.execute(params![
+                id,
+                (index as i64) + 1,
+                line.description.trim(),
+                line.qty_hundredths,
+                line.unit_price_cents,
+                line.inventory_item_id
+            ])?;
+        }
+    }
+    audit::seal_pending(&tx)?;
+    tx.commit()?;
+    recurring_by_id(conn, id)
+}
+
+pub fn delete_recurring_invoice(conn: &mut Connection, id: i64) -> Result<()> {
+    let tx = conn.transaction()?;
+    let removed = tx.execute("DELETE FROM recurring_invoices WHERE id = ?1", [id])?;
+    if removed == 0 {
+        return Err(CoreError::not_found(format!(
+            "recurring invoice {id} does not exist"
+        )));
+    }
     audit::seal_pending(&tx)?;
     tx.commit()?;
     Ok(())
+}
+
+/// Turn every schedule that has come due into real invoices, catching up on any
+/// cycles that were missed while the file was closed. Each generated invoice is
+/// dated the day the schedule fell due, not the day it was generated.
+pub fn generate_due_invoices(conn: &mut Connection, today: &str) -> Result<Vec<Invoice>> {
+    let today = checked_date(today, "today's date")?;
+    let templates: Vec<i64> = {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM recurring_invoices
+              WHERE is_active = 1 AND next_date <= ?1
+                AND (end_date IS NULL OR next_date <= end_date)
+              ORDER BY next_date, id",
+        )?;
+        let rows = stmt.query_map([&today], |row| row.get::<_, i64>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if templates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let accounts = invoice_accounts(conn)?;
+    let tx = conn.transaction()?;
+    let mut created = Vec::new();
+    for id in templates {
+        let (customer_id, tax_bp, mut next, end, frequency) = tx.query_row(
+            "SELECT customer_id, tax_bp, next_date, end_date, frequency
+               FROM recurring_invoices WHERE id = ?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )?;
+        let lines = recurring_lines_of(&tx, id)?;
+        let mut generated = 0;
+        while next.as_str() <= today.as_str()
+            && end.as_deref().map(|end| next.as_str() <= end).unwrap_or(true)
+        {
+            generated += 1;
+            if generated > 500 {
+                return Err(CoreError::validation(
+                    "this schedule is more than 500 invoices behind — pause it and start a new one",
+                ));
+            }
+            let input = InvoiceInput {
+                id: None,
+                invoice_no: None,
+                customer_id,
+                invoice_date: next.clone(),
+                due_date: Some(dates::add_days(&next, 30)),
+                status: "Sent".to_string(),
+                tax_bp,
+                lines: lines
+                    .iter()
+                    .map(|line| InvoiceLineInput {
+                        description: line.description.clone(),
+                        qty_hundredths: line.qty_hundredths,
+                        unit_price_cents: line.unit_price_cents,
+                        inventory_item_id: line.inventory_item_id,
+                    })
+                    .collect(),
+            };
+            created.push(save_invoice_tx(&tx, &accounts, &input)?);
+            next = next_occurrence(&next, &frequency);
+        }
+        let still_running = end
+            .as_deref()
+            .map(|end| next.as_str() <= end)
+            .unwrap_or(true);
+        tx.execute(
+            "UPDATE recurring_invoices SET next_date = ?2, is_active = ?3 WHERE id = ?1",
+            params![id, next, still_running as i64],
+        )?;
+    }
+    audit::seal_pending(&tx)?;
+    tx.commit()?;
+    created.into_iter().map(|id| invoice_by_id(conn, id)).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2518,7 +3143,7 @@ pub fn dashboard(conn: &Connection) -> Result<Dashboard> {
 
     let unpaid_income: i64 = conn.query_row(
         "SELECT COALESCE(SUM(amount_cents + (amount_cents * tax_bp + 5000) / 10000), 0)
-           FROM income_records WHERE is_paid = 0",
+           FROM income_records WHERE is_paid = 0 AND invoice_id IS NULL",
         [],
         |row| row.get(0),
     )?;

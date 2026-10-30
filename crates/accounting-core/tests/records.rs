@@ -554,3 +554,265 @@ fn the_audit_chain_survives_a_full_day_of_bookkeeping() {
     assert!(chain.total > 0);
     assert!(reports::trial_balance(&conn).unwrap().is_balanced);
 }
+
+// ---------------------------------------------------------------------------
+// Income, invoices and schedules
+// ---------------------------------------------------------------------------
+
+fn income_with_number(
+    conn: &mut rusqlite::Connection,
+    number: &str,
+    amount: i64,
+    paid: bool,
+) -> simple::IncomeRecord {
+    simple::save_income(
+        conn,
+        &IncomeInput {
+            id: None,
+            entry_date: "2026-08-03".into(),
+            customer_id: None,
+            category: "Contract Revenue".into(),
+            description: "Deck rebuild".into(),
+            amount_cents: amount,
+            tax_bp: 0,
+            is_paid: paid,
+            invoice_no: number.to_string(),
+        },
+    )
+    .expect("income saved")
+}
+
+#[test]
+fn income_with_an_invoice_number_creates_that_invoice_once() {
+    let mut conn = company();
+    let record = income_with_number(&mut conn, "INV-2001", 150_000, true);
+
+    assert_eq!(record.invoice_no, "INV-2001");
+    let invoice_id = record.invoice_id.expect("the income owns its invoice");
+
+    let invoices = simple::list_invoices(&conn).unwrap();
+    assert_eq!(invoices.len(), 1, "one sale, one invoice");
+    assert_eq!(invoices[0].id, invoice_id);
+    assert_eq!(invoices[0].invoice_no, "INV-2001");
+    assert_eq!(invoices[0].status, "Paid");
+    assert_eq!(invoices[0].total_cents, 150_000);
+
+    // Recording the same sale again is refused, not duplicated.
+    let again = simple::save_income(
+        &mut conn,
+        &IncomeInput {
+            id: None,
+            entry_date: "2026-08-03".into(),
+            customer_id: None,
+            category: "Contract Revenue".into(),
+            description: "Deck rebuild".into(),
+            amount_cents: 150_000,
+            tax_bp: 0,
+            is_paid: true,
+            invoice_no: "INV-2001".into(),
+        },
+    );
+    assert!(again.is_err(), "a paid invoice cannot be paid twice");
+    assert_eq!(simple::list_invoices(&conn).unwrap().len(), 1);
+    assert_eq!(
+        simple::profit_and_loss(&conn, None, None).unwrap().total_income_cents,
+        150_000
+    );
+    assert_eq!(simple::dashboard(&conn).unwrap().cash_cents, 150_000);
+    assert!(reports::trial_balance(&conn).unwrap().is_balanced);
+}
+
+#[test]
+fn automatic_invoice_numbers_skip_numbers_already_in_use() {
+    let mut conn = company();
+    income_with_number(&mut conn, "INV-1007", 10_000, true);
+
+    let next = simple::save_invoice(
+        &mut conn,
+        &InvoiceInput {
+            id: None,
+            invoice_no: None,
+            customer_id: None,
+            invoice_date: "2026-08-20".into(),
+            due_date: None,
+            status: "Sent".into(),
+            tax_bp: 0,
+            lines: vec![InvoiceLineInput {
+                description: "Consulting".into(),
+                qty_hundredths: 100,
+                unit_price_cents: 5_000,
+                inventory_item_id: None,
+            }],
+        },
+    )
+    .unwrap();
+
+    assert_eq!(next.invoice_no, "INV-1008", "the number already taken is skipped");
+}
+
+#[test]
+fn editing_income_moves_its_invoice_with_it() {
+    let mut conn = company();
+    let first = income_with_number(&mut conn, "INV-2010", 50_000, false);
+    let invoice_id = first.invoice_id.unwrap();
+
+    let edited = simple::save_income(
+        &mut conn,
+        &IncomeInput {
+            id: Some(first.id),
+            entry_date: "2026-08-03".into(),
+            customer_id: None,
+            category: "Contract Revenue".into(),
+            description: "Deck rebuild".into(),
+            amount_cents: 75_000,
+            tax_bp: 0,
+            is_paid: false,
+            invoice_no: "INV-2011".into(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(edited.invoice_id, Some(invoice_id), "the same invoice, renumbered");
+    let invoices = simple::list_invoices(&conn).unwrap();
+    assert_eq!(invoices.len(), 1, "editing does not leave a second invoice behind");
+    assert_eq!(invoices[0].invoice_no, "INV-2011");
+    assert_eq!(invoices[0].total_cents, 75_000);
+    assert_eq!(
+        simple::profit_and_loss(&conn, None, None).unwrap().total_income_cents,
+        75_000
+    );
+    assert!(reports::trial_balance(&conn).unwrap().is_balanced);
+}
+
+#[test]
+fn recording_income_against_a_sent_invoice_does_not_count_it_twice() {
+    let mut conn = company();
+    let invoice = simple::save_invoice(
+        &mut conn,
+        &InvoiceInput {
+            id: None,
+            invoice_no: Some("INV-3000".into()),
+            customer_id: None,
+            invoice_date: "2026-08-05".into(),
+            due_date: None,
+            status: "Sent".into(),
+            tax_bp: 0,
+            lines: vec![InvoiceLineInput {
+                description: "Consulting".into(),
+                qty_hundredths: 100,
+                unit_price_cents: 100_000,
+                inventory_item_id: None,
+            }],
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        simple::dashboard(&conn).unwrap().invoice_outstanding_cents,
+        100_000
+    );
+
+    let payment = income_with_number(&mut conn, "inv-3000", 100_000, true);
+    assert_eq!(payment.invoice_no, "INV-3000", "the invoice's own spelling is kept");
+
+    let invoices = simple::list_invoices(&conn).unwrap();
+    assert_eq!(invoices.len(), 1, "the payment settles the invoice, it does not add one");
+    assert_eq!(invoices[0].id, invoice.id);
+    assert_eq!(invoices[0].status, "Paid");
+    assert_eq!(
+        simple::profit_and_loss(&conn, None, None).unwrap().total_income_cents,
+        100_000,
+        "the invoice's revenue is not repeated by the payment"
+    );
+
+    let dash = simple::dashboard(&conn).unwrap();
+    assert_eq!(dash.cash_cents, 100_000);
+    assert_eq!(dash.invoice_outstanding_cents, 0);
+    assert_eq!(dash.unpaid_income_cents, 0);
+    assert!(reports::trial_balance(&conn).unwrap().is_balanced);
+}
+
+#[test]
+fn deleting_income_removes_the_invoice_it_created() {
+    let mut conn = company();
+    let record = income_with_number(&mut conn, "INV-4000", 80_000, true);
+
+    simple::delete_income(&mut conn, record.id).unwrap();
+
+    assert!(simple::list_invoices(&conn).unwrap().is_empty());
+    assert_eq!(simple::dashboard(&conn).unwrap().cash_cents, 0);
+    assert!(reports::trial_balance(&conn).unwrap().is_balanced);
+}
+
+fn monthly_schedule(
+    conn: &mut rusqlite::Connection,
+    end_date: Option<&str>,
+) -> simple::RecurringInvoice {
+    simple::save_recurring_invoice(
+        conn,
+        &simple::RecurringInvoiceInput {
+            id: None,
+            customer_id: None,
+            description: "Monthly retainer".into(),
+            frequency: "Monthly".into(),
+            start_date: "2026-01-15".into(),
+            end_date: end_date.map(str::to_string),
+            tax_bp: 0,
+            is_active: true,
+            lines: vec![InvoiceLineInput {
+                description: "Retainer".into(),
+                qty_hundredths: 100,
+                unit_price_cents: 25_000,
+                inventory_item_id: None,
+            }],
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_recurring_invoice_produces_one_invoice_per_cycle() {
+    let mut conn = company();
+    let schedule = monthly_schedule(&mut conn, None);
+    assert_eq!(schedule.next_date, "2026-01-15");
+
+    let created = simple::generate_due_invoices(&mut conn, "2026-03-15").unwrap();
+    let dates: Vec<&str> = created
+        .iter()
+        .map(|invoice| invoice.invoice_date.as_str())
+        .collect();
+    assert_eq!(dates, vec!["2026-01-15", "2026-02-15", "2026-03-15"]);
+    assert!(created.iter().all(|invoice| invoice.status == "Sent"));
+    let numbers: Vec<String> = created
+        .iter()
+        .map(|invoice| invoice.invoice_no.clone())
+        .collect();
+    assert_eq!(numbers, vec!["INV-1001", "INV-1002", "INV-1003"]);
+
+    assert!(
+        simple::generate_due_invoices(&mut conn, "2026-03-15").unwrap().is_empty(),
+        "a cycle is only invoiced once"
+    );
+    let schedule = simple::get_recurring_invoice(&conn, schedule.id).unwrap();
+    assert_eq!(schedule.next_date, "2026-04-15");
+    assert!(schedule.is_active);
+
+    assert_eq!(
+        simple::profit_and_loss(&conn, None, None).unwrap().total_income_cents,
+        75_000
+    );
+    assert!(reports::trial_balance(&conn).unwrap().is_balanced);
+}
+
+#[test]
+fn a_schedule_stops_at_its_end_date() {
+    let mut conn = company();
+    let schedule = monthly_schedule(&mut conn, Some("2026-03-31"));
+
+    let created = simple::generate_due_invoices(&mut conn, "2026-06-15").unwrap();
+    assert_eq!(created.len(), 3, "January, February and March only");
+
+    let schedule = simple::get_recurring_invoice(&conn, schedule.id).unwrap();
+    assert!(!schedule.is_active, "nothing is left to invoice");
+    assert_eq!(schedule.next_date, "2026-04-15");
+    assert!(simple::generate_due_invoices(&mut conn, "2026-12-31").unwrap().is_empty());
+}

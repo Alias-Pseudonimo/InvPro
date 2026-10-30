@@ -35,6 +35,9 @@ import type {
   Purchase,
   PurchaseInput,
   PurchaseLine,
+  RecurringFrequency,
+  RecurringInvoice,
+  RecurringInvoiceInput,
   TaxSummary,
   TrialBalanceReport,
   Vendor,
@@ -79,6 +82,9 @@ interface State {
   income: IncomeRecord[];
   expenses: ExpenseRecord[];
   invoices: Invoice[];
+  /* Invoices the mock created from an income record, removed with it. */
+  autoInvoices: number[];
+  recurring: RecurringInvoice[];
   purchases: Purchase[];
   payroll: PayrollRun[];
   settings: Record<string, string>;
@@ -101,6 +107,8 @@ function emptyState(): State {
     income: [],
     expenses: [],
     invoices: [],
+    autoInvoices: [],
+    recurring: [],
     purchases: [],
     payroll: [],
     settings: { currency: "USD", invoice_income_account: "Sales Revenue" },
@@ -113,6 +121,28 @@ let state: State = emptyState();
 function id(kind: string): number {
   state.next[kind] = (state.next[kind] ?? 0) + 1;
   return state.next[kind];
+}
+
+function addDays(date: string, days: number): string {
+  const [year, month, day] = date.split("-").map(Number);
+  const value = new Date(Date.UTC(year, month - 1, day));
+  value.setUTCDate(value.getUTCDate() + days);
+  return value.toISOString().slice(0, 10);
+}
+
+function addMonths(date: string, months: number): string {
+  const [year, month, day] = date.split("-").map(Number);
+  const value = new Date(Date.UTC(year, month - 1 + months, 1));
+  const lastDay = new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth() + 1, 0)).getUTCDate();
+  value.setUTCDate(Math.min(day, lastDay));
+  return value.toISOString().slice(0, 10);
+}
+
+function advance(date: string, frequency: RecurringFrequency): string {
+  if (frequency === "Weekly") return addDays(date, 7);
+  if (frequency === "Quarterly") return addMonths(date, 3);
+  if (frequency === "Yearly") return addMonths(date, 12);
+  return addMonths(date, 1);
 }
 
 function auditRow(action: string, entity: string, entityId: number, after: unknown) {
@@ -265,6 +295,7 @@ function seed() {
       totalCents: amount + tax,
       isPaid: paid,
       invoiceNo,
+      invoiceId: null,
       journalEntryId: id("entry"),
     };
     state.income.push(record);
@@ -674,6 +705,87 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
       const input = payload.input as IncomeInput;
       const tax = Math.round((input.amountCents * (input.taxBp ?? 0)) / 10_000);
       const customer = state.customers.find((candidate) => candidate.id === input.customerId);
+      const previous = state.income.find((candidate) => candidate.id === input.id);
+      const number = (input.invoiceNo ?? "").trim();
+
+      // An invoice number on an income record means exactly one invoice: created
+      // from the income if the number is new, settled if it already exists.
+      let invoiceId: number | null = null;
+      if (number) {
+        let invoice = state.invoices.find(
+          (candidate) => candidate.invoiceNo.toLowerCase() === number.toLowerCase(),
+        );
+        if (invoice && invoice.id !== previous?.invoiceId) {
+          if (invoice.status === "Paid") {
+            throw new Error(`invoice ${invoice.invoiceNo} is already paid; this income would be counted twice`);
+          }
+          if (invoice.status === "Draft") {
+            throw new Error(`invoice ${invoice.invoiceNo} is still a draft — send it first, or record this income without the invoice number`);
+          }
+        }
+        if (!invoice && previous?.invoiceId && state.autoInvoices.includes(previous.invoiceId)) {
+          invoice = state.invoices.find((candidate) => candidate.id === previous.invoiceId);
+        }
+        if (invoice) {
+          // Only the invoice this income created follows the edit; one that was
+          // already there keeps its own date and amount.
+          if (state.autoInvoices.includes(invoice.id)) {
+            invoice.invoiceNo = number;
+            invoice.invoiceDate = input.entryDate;
+            invoice.lines = [
+              {
+                id: invoice.lines[0]?.id ?? id("invoice_line"),
+                position: 1,
+                description: (input.description ?? "").trim() || input.category,
+                qtyHundredths: 100,
+                unitPriceCents: input.amountCents,
+                amountCents: input.amountCents,
+                inventoryItemId: null,
+              },
+            ];
+            invoice.subtotalCents = input.amountCents;
+            invoice.taxCents = tax;
+            invoice.totalCents = input.amountCents + tax;
+          }
+          if (invoice.status === "Sent" && input.isPaid) invoice.status = "Paid";
+        } else {
+          const description = (input.description ?? "").trim() || input.category;
+          invoice = {
+            id: id("invoice"),
+            invoiceNo: number,
+            customerId: input.customerId ?? null,
+            customerName: customer?.name ?? "",
+            invoiceDate: input.entryDate,
+            dueDate: null,
+            status: input.isPaid ? "Paid" : "Sent",
+            taxBp: input.taxBp ?? 0,
+            subtotalCents: input.amountCents,
+            taxCents: tax,
+            totalCents: input.amountCents + tax,
+            stockDeducted: false,
+            lines: [
+              {
+                id: id("invoice_line"),
+                position: 1,
+                description,
+                qtyHundredths: 100,
+                unitPriceCents: input.amountCents,
+                amountCents: input.amountCents,
+                inventoryItemId: null,
+              },
+            ],
+          };
+          state.invoices.push(invoice);
+          state.autoInvoices.push(invoice.id);
+        }
+        invoiceId = invoice.id;
+      }
+
+      if (previous?.invoiceId && state.autoInvoices.includes(previous.invoiceId) && previous.invoiceId !== invoiceId) {
+        state.invoices = state.invoices.filter((candidate) => candidate.id !== previous.invoiceId);
+        state.autoInvoices = state.autoInvoices.filter((candidate) => candidate !== previous.invoiceId);
+      }
+
       const record: IncomeRecord = {
         id: input.id ?? id("income"),
         entryDate: input.entryDate,
@@ -686,8 +798,9 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
         taxCents: tax,
         totalCents: input.amountCents + tax,
         isPaid: Boolean(input.isPaid),
-        invoiceNo: input.invoiceNo ?? "",
-        journalEntryId: id("entry"),
+        invoiceNo: number,
+        invoiceId,
+        journalEntryId: invoiceId ? null : id("entry"),
       };
       const index = state.income.findIndex((candidate) => candidate.id === record.id);
       if (index >= 0) state.income[index] = record;
@@ -696,10 +809,16 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
       return record as T;
     }
 
-    case "delete_income":
+    case "delete_income": {
       requireOpen();
-      state.income = state.income.filter((record) => record.id !== payload.id);
+      const record = state.income.find((candidate) => candidate.id === payload.id);
+      if (record?.invoiceId && state.autoInvoices.includes(record.invoiceId)) {
+        state.invoices = state.invoices.filter((candidate) => candidate.id !== record.invoiceId);
+        state.autoInvoices = state.autoInvoices.filter((candidate) => candidate !== record.invoiceId);
+      }
+      state.income = state.income.filter((candidate) => candidate.id !== payload.id);
       return undefined as T;
+    }
 
     case "list_expenses":
       requireOpen();
@@ -850,6 +969,96 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
       }
       state.invoices = state.invoices.filter((candidate) => candidate.id !== payload.id);
       return undefined as T;
+    }
+
+    case "list_recurring_invoices":
+      requireOpen();
+      return state.recurring
+        .slice()
+        .sort((left, right) => left.nextDate.localeCompare(right.nextDate)) as T;
+
+    case "save_recurring_invoice": {
+      requireOpen();
+      const input = payload.input as RecurringInvoiceInput;
+      const lines: InvoiceLine[] = input.lines.map((line, index) => ({
+        id: id("recurring_line"),
+        position: index + 1,
+        description: line.description,
+        qtyHundredths: line.qtyHundredths,
+        unitPriceCents: line.unitPriceCents,
+        amountCents: Math.round((line.qtyHundredths * line.unitPriceCents) / 100),
+        inventoryItemId: line.inventoryItemId ?? null,
+      }));
+      const subtotal = lines.reduce((sum, line) => sum + line.amountCents, 0);
+      const customer = state.customers.find((candidate) => candidate.id === input.customerId);
+      const existing = state.recurring.find((candidate) => candidate.id === input.id);
+      const record: RecurringInvoice = {
+        id: input.id ?? id("recurring"),
+        customerId: input.customerId ?? null,
+        customerName: customer?.name ?? "",
+        description: input.description ?? "",
+        frequency: input.frequency,
+        startDate: input.startDate,
+        nextDate: existing && existing.nextDate > input.startDate ? existing.nextDate : input.startDate,
+        endDate: input.endDate ?? null,
+        taxBp: input.taxBp,
+        isActive: input.isActive ?? true,
+        subtotalCents: subtotal,
+        totalCents: subtotal + Math.round((subtotal * input.taxBp) / 10_000),
+        lines,
+      };
+      if (existing) Object.assign(existing, record);
+      else state.recurring.push(record);
+      auditRow(existing ? "UPDATE" : "INSERT", "recurring_invoices", record.id, record);
+      return record as T;
+    }
+
+    case "delete_recurring_invoice":
+      requireOpen();
+      state.recurring = state.recurring.filter((candidate) => candidate.id !== payload.id);
+      return undefined as T;
+
+    case "generate_due_invoices": {
+      requireOpen();
+      const today = String(payload.today ?? "");
+      const due = state.recurring.filter(
+        (schedule) =>
+          schedule.isActive &&
+          schedule.nextDate <= today &&
+          (!schedule.endDate || schedule.nextDate <= schedule.endDate),
+      );
+      const created: Invoice[] = [];
+      for (const schedule of due) {
+        let next = schedule.nextDate;
+        while (next <= today && (!schedule.endDate || next <= schedule.endDate)) {
+          const highest = state.invoices.reduce((best, invoice) => {
+            const digits = Number(invoice.invoiceNo.split("-").pop());
+            return Number.isFinite(digits) ? Math.max(best, digits) : best;
+          }, 1000);
+          const tax = Math.round((schedule.subtotalCents * schedule.taxBp) / 10_000);
+          const record: Invoice = {
+            id: id("invoice"),
+            invoiceNo: `INV-${highest + 1}`,
+            customerId: schedule.customerId,
+            customerName: schedule.customerName,
+            invoiceDate: next,
+            dueDate: addDays(next, 30),
+            status: "Sent",
+            taxBp: schedule.taxBp,
+            subtotalCents: schedule.subtotalCents,
+            taxCents: tax,
+            totalCents: schedule.subtotalCents + tax,
+            stockDeducted: false,
+            lines: schedule.lines.map((line) => ({ ...line, id: id("invoice_line") })),
+          };
+          state.invoices.push(record);
+          created.push(record);
+          next = advance(next, schedule.frequency);
+        }
+        schedule.nextDate = next;
+        schedule.isActive = !schedule.endDate || next <= schedule.endDate;
+      }
+      return created as T;
     }
 
     case "list_purchases":

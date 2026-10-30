@@ -22,14 +22,35 @@ interface Props {
 
 const INCOME_CATEGORIES = ["Contract Revenue", "Service Revenue", "Sales Revenue", "Change Order Revenue"];
 const EXPENSE_CATEGORIES = ["Materials", "Equipment Rental", "Vehicle & Fuel", "Insurance", "Office & Admin"];
+const NEW_CATEGORY = "__new__";
 
 export function IncomeScreen({ revision, changed }: Props) {
   const { data, error } = useLoad(() => api.listIncome(), [revision]);
   const customers = useLoad<Customer[]>(() => api.listCustomers(), [revision]).data ?? [];
+  const accounts = useLoad(() => api.listAccounts(), [revision]).data ?? [];
   const [editing, setEditing] = useState<IncomeRecord | "new" | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
+  const [newCategory, setNewCategory] = useState(false);
 
-  const categories = [...new Set([...INCOME_CATEGORIES, ...(data ?? []).map((record) => record.category)])];
+  // Everything the owner could pick, in one list: what they have used before,
+  // what the chart of accounts already holds, and the starter names.
+  const categories = [
+    ...new Set([
+      ...INCOME_CATEGORIES,
+      ...(data ?? []).map((record) => record.category),
+      ...accounts
+        .filter((account) => account.accountType === "INCOME" || account.accountType === "OTHER_INCOME")
+        .map((account) => account.name),
+    ]),
+  ]
+    .filter((category) => category.trim() && category !== "Uncategorized")
+    .sort((left, right) => left.localeCompare(right));
+
+  function open(record: IncomeRecord | "new") {
+    setEditing(record);
+    setFormError(null);
+    setNewCategory(false);
+  }
 
   async function remove(record: IncomeRecord) {
     if (!window.confirm(`Delete this income of ${money(record.totalCents)}? The entry is reversed, not erased from the audit log.`)) return;
@@ -47,7 +68,7 @@ export function IncomeScreen({ revision, changed }: Props) {
         <div className="muted small">
           Money you have earned. Recording it here keeps your books right without you touching a journal.
         </div>
-        <button type="button" className="btn btn-primary" onClick={() => setEditing("new")}>
+        <button type="button" className="btn btn-primary" onClick={() => open("new")}>
           + Record income
         </button>
       </div>
@@ -75,7 +96,7 @@ export function IncomeScreen({ revision, changed }: Props) {
                   <Empty>
                     Nothing recorded yet.
                     <div className="cta">
-                      <button type="button" className="btn btn-primary btn-sm" onClick={() => setEditing("new")}>
+                      <button type="button" className="btn btn-primary btn-sm" onClick={() => open("new")}>
                         + Record your first income
                       </button>
                     </div>
@@ -96,7 +117,7 @@ export function IncomeScreen({ revision, changed }: Props) {
                   <td className="num money-pos">{money(record.totalCents)}</td>
                   <td>
                     <div className="row-actions">
-                      <button type="button" className="btn btn-sm btn-ghost" onClick={() => setEditing(record)}>
+                      <button type="button" className="btn btn-sm btn-ghost" onClick={() => open(record)}>
                         Edit
                       </button>
                       <button type="button" className="btn btn-sm btn-danger" onClick={() => void remove(record)}>
@@ -120,7 +141,10 @@ export function IncomeScreen({ revision, changed }: Props) {
                   id: editing === "new" ? null : editing.id,
                   entryDate: field(form, "entryDate") || today(),
                   customerId: Number(field(form, "customerId")) || null,
-                  category: field(form, "category") || "Uncategorized",
+                  category:
+                    field(form, "category") === NEW_CATEGORY
+                      ? field(form, "categoryNew") || "Uncategorized"
+                      : field(form, "category") || "Uncategorized",
                   description: field(form, "description"),
                   amountCents: toCents(form.get("amount")),
                   taxBp: Math.round(Number(field(form, "taxPct") || "0") * 100),
@@ -163,14 +187,26 @@ export function IncomeScreen({ revision, changed }: Props) {
               <div className="field-row3">
                 <div className="field">
                   <label>
-                    Category <span className="hint-inline">new names become accounts</span>
+                    Category <span className="hint-inline">pick one or add your own</span>
                   </label>
-                  <input list="income-categories" name="category" defaultValue={editing === "new" ? "Contract Revenue" : editing.category} />
-                  <datalist id="income-categories">
+                  <select
+                    name="category"
+                    defaultValue={editing === "new" ? "Contract Revenue" : editing.category}
+                    onChange={(event) => setNewCategory(event.target.value === NEW_CATEGORY)}
+                  >
                     {categories.map((category) => (
-                      <option key={category} value={category} />
+                      <option key={category} value={category}>
+                        {category}
+                      </option>
                     ))}
-                  </datalist>
+                    {editing !== "new" && !categories.includes(editing.category) && (
+                      <option value={editing.category}>{editing.category}</option>
+                    )}
+                    <option value={NEW_CATEGORY}>+ New category…</option>
+                  </select>
+                  {newCategory && (
+                    <input name="categoryNew" placeholder="Name the new category" autoFocus />
+                  )}
                 </div>
                 <div className="field">
                   <label>Amount</label>
@@ -183,8 +219,10 @@ export function IncomeScreen({ revision, changed }: Props) {
               </div>
               <div className="field-row">
                 <div className="field">
-                  <label>Invoice #</label>
-                  <input name="invoiceNo" defaultValue={editing === "new" ? "" : editing.invoiceNo} />
+                  <label>
+                    Invoice # <span className="hint-inline">creates or settles that invoice</span>
+                  </label>
+                  <input name="invoiceNo" defaultValue={editing === "new" ? "" : editing.invoiceNo} placeholder="none" />
                 </div>
                 <div className="field">
                   <label>Status</label>
@@ -196,7 +234,8 @@ export function IncomeScreen({ revision, changed }: Props) {
               </div>
               <div className="settings-note">
                 Paid income goes straight to your bank account. Unpaid income waits in receivables until it arrives, so your
-                cash figure stays honest.
+                cash figure stays honest. Give it an invoice number and the invoice appears on the Invoices screen too — the
+                same sale, never twice. If that invoice is already there, this records the payment against it.
               </div>
             </div>
             <div className="modal-foot">

@@ -26,6 +26,8 @@ import type {
   ProfitAndLoss,
   Purchase,
   PurchaseInput,
+  RecurringInvoice,
+  RecurringInvoiceInput,
   Setting,
   TaxSummary,
   TrialBalanceReport,
@@ -87,6 +89,12 @@ export const api = {
   getInvoice: (id: number) => call<Invoice>("get_invoice", { id }),
   saveInvoice: (input: InvoiceInput) => call<Invoice>("save_invoice", { input }),
   deleteInvoice: (id: number) => call<void>("delete_invoice", { id }),
+  listRecurringInvoices: () => call<RecurringInvoice[]>("list_recurring_invoices"),
+  saveRecurringInvoice: (input: RecurringInvoiceInput) =>
+    call<RecurringInvoice>("save_recurring_invoice", { input }),
+  deleteRecurringInvoice: (id: number) => call<void>("delete_recurring_invoice", { id }),
+  generateDueInvoices: (todayDate: string) =>
+    call<Invoice[]>("generate_due_invoices", { today: todayDate }),
   listPurchases: () => call<Purchase[]>("list_purchases"),
   savePurchase: (input: PurchaseInput) => call<Purchase>("save_purchase", { input }),
   deletePurchase: (id: number) => call<void>("delete_purchase", { id }),

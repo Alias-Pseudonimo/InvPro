@@ -1,6 +1,15 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { api } from "../api";
-import type { Customer, InventoryItem, Invoice, InvoiceStatus, Purchase, Vendor } from "../types";
+import type {
+  Customer,
+  InventoryItem,
+  Invoice,
+  InvoiceStatus,
+  Purchase,
+  RecurringFrequency,
+  RecurringInvoice,
+  Vendor,
+} from "../types";
 import { Empty, ErrorNote, Modal, Pill, centsInput, field, money, qtyInput, submitHandler, toCents, toHundredths, useLoad } from "../ui";
 import { today } from "../format";
 
@@ -37,15 +46,106 @@ function statusTone(status: InvoiceStatus): "paid" | "unpaid" | "draft" {
 /* Invoices                                                           */
 /* ------------------------------------------------------------------ */
 
+/** The line grid an invoice and a recurring schedule both use. */
+function LineEditor({
+  lines,
+  setLines,
+  items,
+  totals,
+}: {
+  lines: DraftLine[];
+  setLines: React.Dispatch<React.SetStateAction<DraftLine[]>>;
+  items: InventoryItem[];
+  totals?: ReactNode;
+}) {
+  function updateLine(key: number, patch: Partial<DraftLine>) {
+    setLines((current) => current.map((line) => (line.key === key ? { ...line, ...patch } : line)));
+  }
+
+  function pickItem(key: number, itemId: string) {
+    const item = items.find((candidate) => String(candidate.id) === itemId);
+    setLines((current) =>
+      current.map((line) =>
+        line.key === key
+          ? {
+              ...line,
+              itemId,
+              description: item && !line.description ? item.name : line.description,
+              price: item && item.salePriceCents > 0 ? centsInput(item.salePriceCents) : line.price,
+            }
+          : line,
+      ),
+    );
+  }
+
+  return (
+    <>
+      <div className="line-grid line-head">
+        <span>Description</span>
+        <span>Stock item</span>
+        <span>Qty</span>
+        <span>Price</span>
+        <span />
+      </div>
+      {lines.map((line) => (
+        <div className="line-grid" key={line.key}>
+          <input
+            placeholder="What are you billing for?"
+            value={line.description}
+            onChange={(event) => updateLine(line.key, { description: event.target.value })}
+          />
+          <select value={line.itemId} onChange={(event) => pickItem(line.key, event.target.value)}>
+            <option value="">— none —</option>
+            {items
+              .filter((item) => item.kind !== "Consumable")
+              .map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.name}
+                </option>
+              ))}
+          </select>
+          <input value={line.qty} onChange={(event) => updateLine(line.key, { qty: event.target.value })} />
+          <input value={line.price} onChange={(event) => updateLine(line.key, { price: event.target.value })} />
+          <button
+            type="button"
+            className="icon-btn"
+            onClick={() =>
+              setLines((current) =>
+                current.length === 1 ? [blankLine()] : current.filter((row) => row.key !== line.key),
+              )
+            }
+            aria-label="Remove line"
+          >
+            ✕
+          </button>
+        </div>
+      ))}
+      <div className="line-foot">
+        <button type="button" className="btn btn-sm" onClick={() => setLines((current) => [...current, blankLine()])}>
+          + Add line
+        </button>
+        {totals}
+      </div>
+    </>
+  );
+}
+
 export function InvoicesScreen({ revision, changed }: Props) {
   const { data, error } = useLoad(() => api.listInvoices(), [revision]);
   const customers = useLoad<Customer[]>(() => api.listCustomers(), [revision]).data ?? [];
   const items = useLoad<InventoryItem[]>(() => api.listInventory(), [revision]).data ?? [];
 
+  const schedules = useLoad<RecurringInvoice[]>(() => api.listRecurringInvoices(), [revision]).data ?? [];
+
   const [editing, setEditing] = useState<Invoice | "new" | null>(null);
   const [lines, setLines] = useState<DraftLine[]>([blankLine()]);
   const [taxPct, setTaxPct] = useState("0");
   const [formError, setFormError] = useState<string | null>(null);
+
+  const [schedule, setSchedule] = useState<RecurringInvoice | "new" | null>(null);
+  const [scheduleLines, setScheduleLines] = useState<DraftLine[]>([blankLine()]);
+  const [scheduleTax, setScheduleTax] = useState("0");
+  const [scheduleError, setScheduleError] = useState<string | null>(null);
 
   function open(record: Invoice | "new") {
     setEditing(record);
@@ -67,28 +167,53 @@ export function InvoicesScreen({ revision, changed }: Props) {
     }
   }
 
-  function updateLine(key: number, patch: Partial<DraftLine>) {
-    setLines((current) => current.map((line) => (line.key === key ? { ...line, ...patch } : line)));
-  }
-
-  function pickItem(key: number, itemId: string) {
-    const item = items.find((candidate) => String(candidate.id) === itemId);
-    setLines((current) =>
-      current.map((line) =>
-        line.key === key
-          ? {
-              ...line,
-              itemId,
-              description: item && !line.description ? item.name : line.description,
-              price: item && item.salePriceCents > 0 ? centsInput(item.salePriceCents) : line.price,
-            }
-          : line,
-      ),
-    );
-  }
-
   const subtotal = lines.reduce((sum, line) => sum + lineAmount(line), 0);
   const tax = Math.round((subtotal * (Number(taxPct) || 0) * 100) / 10_000);
+  const scheduleSubtotal = scheduleLines.reduce((sum, line) => sum + lineAmount(line), 0);
+  const scheduleTaxCents = Math.round((scheduleSubtotal * (Number(scheduleTax) || 0) * 100) / 10_000);
+
+  function openSchedule(record: RecurringInvoice | "new") {
+    setSchedule(record);
+    setScheduleError(null);
+    if (record === "new") {
+      setScheduleLines([blankLine()]);
+      setScheduleTax("0");
+    } else {
+      setScheduleLines(
+        record.lines.map((line) => ({
+          key: ++lineKey,
+          description: line.description,
+          qty: qtyInput(line.qtyHundredths),
+          price: centsInput(line.unitPriceCents),
+          itemId: line.inventoryItemId ? String(line.inventoryItemId) : "",
+        })),
+      );
+      setScheduleTax((record.taxBp / 100).toFixed(2));
+    }
+  }
+
+  async function removeSchedule(record: RecurringInvoice) {
+    if (!window.confirm(`Stop this ${record.frequency.toLowerCase()} schedule? Invoices it already raised stay.`)) return;
+    try {
+      await api.deleteRecurringInvoice(record.id);
+      changed("Schedule deleted");
+    } catch (err) {
+      window.alert(String(err));
+    }
+  }
+
+  async function generateDue() {
+    try {
+      const created = await api.generateDueInvoices(today());
+      changed(
+        created.length === 0
+          ? "Nothing is due right now"
+          : `${created.length} invoice${created.length === 1 ? "" : "s"} created from schedules`,
+      );
+    } catch (err) {
+      window.alert(String(err));
+    }
+  }
 
   async function setStatus(invoice: Invoice, status: InvoiceStatus) {
     try {
@@ -207,6 +332,75 @@ export function InvoicesScreen({ revision, changed }: Props) {
         </table>
       </div>
 
+      <div className="card" style={{ marginTop: 18 }}>
+        <div className="card-head">
+          <div>
+            <h3>Recurring invoices</h3>
+            <div className="hint">
+              A schedule raises a sent invoice every period, dated the day it falls due. Nothing is skipped while the app is
+              closed — the missed cycles are created the next time you ask.
+            </div>
+          </div>
+          <div className="card-actions">
+            <button type="button" className="btn btn-sm" onClick={() => void generateDue()}>
+              Create due invoices
+            </button>
+            <button type="button" className="btn btn-sm btn-primary" onClick={() => openSchedule("new")}>
+              + New schedule
+            </button>
+          </div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Next invoice</th>
+              <th>Customer</th>
+              <th>What it bills</th>
+              <th>How often</th>
+              <th>Status</th>
+              <th className="num">Total</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {schedules.length === 0 ? (
+              <tr>
+                <td colSpan={7}>
+                  <Empty>
+                    Nothing scheduled yet. Set it up once and the invoices arrive on their own.
+                  </Empty>
+                </td>
+              </tr>
+            ) : (
+              schedules.map((record) => (
+                <tr key={record.id}>
+                  <td className="num date-cell">{record.nextDate}</td>
+                  <td>{record.customerName || "—"}</td>
+                  <td>
+                    {record.description || record.lines.map((line) => line.description).filter(Boolean).join(", ") || "—"}
+                  </td>
+                  <td className="muted">{record.frequency}</td>
+                  <td>
+                    <Pill tone={record.isActive ? "paid" : "draft"}>{record.isActive ? "Active" : "Paused"}</Pill>
+                  </td>
+                  <td className="num">{money(record.totalCents)}</td>
+                  <td>
+                    <div className="row-actions">
+                      <button type="button" className="btn btn-sm btn-ghost" onClick={() => openSchedule(record)}>
+                        Edit
+                      </button>
+                      <button type="button" className="btn btn-sm btn-danger" onClick={() => void removeSchedule(record)}>
+                        Delete
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+
       {editing && (
         <Modal title={editing === "new" ? "New invoice" : `Edit ${editing.invoiceNo}`} onClose={() => setEditing(null)} wide>
           <form
@@ -274,64 +468,30 @@ export function InvoicesScreen({ revision, changed }: Props) {
               </div>
 
               <label>Lines</label>
-              <div className="line-grid line-head">
-                <span>Description</span>
-                <span>Stock item</span>
-                <span>Qty</span>
-                <span>Price</span>
-                <span />
-              </div>
-              {lines.map((line) => (
-                <div className="line-grid" key={line.key}>
-                  <input
-                    placeholder="What are you billing for?"
-                    value={line.description}
-                    onChange={(event) => updateLine(line.key, { description: event.target.value })}
-                  />
-                  <select value={line.itemId} onChange={(event) => pickItem(line.key, event.target.value)}>
-                    <option value="">— none —</option>
-                    {items
-                      .filter((item) => item.kind !== "Consumable")
-                      .map((item) => (
-                        <option key={item.id} value={item.id}>
-                          {item.name}
-                        </option>
-                      ))}
-                  </select>
-                  <input value={line.qty} onChange={(event) => updateLine(line.key, { qty: event.target.value })} />
-                  <input value={line.price} onChange={(event) => updateLine(line.key, { price: event.target.value })} />
-                  <button
-                    type="button"
-                    className="icon-btn"
-                    onClick={() => setLines((current) => (current.length === 1 ? [blankLine()] : current.filter((row) => row.key !== line.key)))}
-                    aria-label="Remove line"
-                  >
-                    ✕
-                  </button>
-                </div>
-              ))}
-              <div className="line-foot">
-                <button type="button" className="btn btn-sm" onClick={() => setLines((current) => [...current, blankLine()])}>
-                  + Add line
-                </button>
-                <div className="totals">
-                  <div className="kv">
-                    <span>Subtotal</span>
-                    <strong className="num">{money(subtotal)}</strong>
+              <LineEditor
+                lines={lines}
+                setLines={setLines}
+                items={items}
+                totals={
+                  <div className="totals">
+                    <div className="kv">
+                      <span>Subtotal</span>
+                      <strong className="num">{money(subtotal)}</strong>
+                    </div>
+                    <div className="kv">
+                      <span>
+                        Tax %
+                        <input className="tiny-input" value={taxPct} onChange={(event) => setTaxPct(event.target.value)} />
+                      </span>
+                      <strong className="num">{money(tax)}</strong>
+                    </div>
+                    <div className="kv total">
+                      <span>Total</span>
+                      <strong className="num">{money(subtotal + tax)}</strong>
+                    </div>
                   </div>
-                  <div className="kv">
-                    <span>
-                      Tax %
-                      <input className="tiny-input" value={taxPct} onChange={(event) => setTaxPct(event.target.value)} />
-                    </span>
-                    <strong className="num">{money(tax)}</strong>
-                  </div>
-                  <div className="kv total">
-                    <span>Total</span>
-                    <strong className="num">{money(subtotal + tax)}</strong>
-                  </div>
-                </div>
-              </div>
+                }
+              />
               <div className="settings-note">
                 Linking a line to a stock item carries the item through: sending the invoice lowers the quantity and books the
                 cost of goods sold at the item's cost.
@@ -343,6 +503,136 @@ export function InvoicesScreen({ revision, changed }: Props) {
               </button>
               <button type="submit" className="btn btn-primary">
                 Save invoice
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+      {schedule && (
+        <Modal
+          title={schedule === "new" ? "New recurring invoice" : "Edit recurring invoice"}
+          onClose={() => setSchedule(null)}
+          wide
+        >
+          <form
+            onSubmit={submitHandler(
+              async (form) => {
+                await api.saveRecurringInvoice({
+                  id: schedule === "new" ? null : schedule.id,
+                  customerId: Number(field(form, "customerId")) || null,
+                  description: field(form, "description"),
+                  frequency: field(form, "frequency") as RecurringFrequency,
+                  startDate: field(form, "startDate") || today(),
+                  endDate: field(form, "endDate") || null,
+                  taxBp: Math.round(Number(scheduleTax || "0") * 100),
+                  isActive: field(form, "state") !== "Paused",
+                  lines: scheduleLines
+                    .filter((line) => line.description.trim() || Number(line.price) > 0)
+                    .map((line) => ({
+                      description: line.description,
+                      qtyHundredths: toHundredths(line.qty),
+                      unitPriceCents: toCents(line.price),
+                      inventoryItemId: Number(line.itemId) || null,
+                    })),
+                });
+                changed("Schedule saved");
+              },
+              setScheduleError,
+              () => setSchedule(null),
+            )}
+          >
+            <div className="modal-body">
+              {scheduleError && <ErrorNote text={scheduleError} />}
+              <div className="field-row3">
+                <div className="field">
+                  <label>First invoice</label>
+                  <input type="date" name="startDate" defaultValue={schedule === "new" ? today() : schedule.startDate} />
+                </div>
+                <div className="field">
+                  <label>How often</label>
+                  <select name="frequency" defaultValue={schedule === "new" ? "Monthly" : schedule.frequency}>
+                    <option value="Weekly">Weekly</option>
+                    <option value="Monthly">Monthly</option>
+                    <option value="Quarterly">Quarterly</option>
+                    <option value="Yearly">Yearly</option>
+                  </select>
+                </div>
+                <div className="field">
+                  <label>Last one (optional)</label>
+                  <input type="date" name="endDate" defaultValue={schedule === "new" ? "" : schedule.endDate ?? ""} />
+                </div>
+              </div>
+              <div className="field-row">
+                <div className="field">
+                  <label>Customer</label>
+                  <select name="customerId" defaultValue={schedule === "new" ? "" : schedule.customerId ?? ""}>
+                    <option value="">— no customer —</option>
+                    {customers.map((customer) => (
+                      <option key={customer.id} value={customer.id}>
+                        {customer.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="field">
+                  <label>Status</label>
+                  <select name="state" defaultValue={schedule !== "new" && !schedule.isActive ? "Paused" : "Active"}>
+                    <option value="Active">Active — keep invoicing</option>
+                    <option value="Paused">Paused — skip until I resume</option>
+                  </select>
+                </div>
+              </div>
+              <div className="field">
+                <label>
+                  What it bills <span className="hint-inline">the label shown in the schedule list</span>
+                </label>
+                <input
+                  name="description"
+                  defaultValue={schedule === "new" ? "" : schedule.description}
+                  placeholder="Monthly maintenance retainer"
+                />
+              </div>
+
+              <label>Lines</label>
+              <LineEditor
+                lines={scheduleLines}
+                setLines={setScheduleLines}
+                items={items}
+                totals={
+                  <div className="totals">
+                    <div className="kv">
+                      <span>Subtotal</span>
+                      <strong className="num">{money(scheduleSubtotal)}</strong>
+                    </div>
+                    <div className="kv">
+                      <span>
+                        Tax %
+                        <input
+                          className="tiny-input"
+                          value={scheduleTax}
+                          onChange={(event) => setScheduleTax(event.target.value)}
+                        />
+                      </span>
+                      <strong className="num">{money(scheduleTaxCents)}</strong>
+                    </div>
+                    <div className="kv total">
+                      <span>Total</span>
+                      <strong className="num">{money(scheduleSubtotal + scheduleTaxCents)}</strong>
+                    </div>
+                  </div>
+                }
+              />
+              <div className="settings-note">
+                Each period becomes a real invoice marked sent, so receivables, stock and the cost of goods sold follow the
+                usual rules. Nothing is posted until a due invoice is created.
+              </div>
+            </div>
+            <div className="modal-foot">
+              <button type="button" className="btn btn-ghost" onClick={() => setSchedule(null)}>
+                Cancel
+              </button>
+              <button type="submit" className="btn btn-primary">
+                Save schedule
               </button>
             </div>
           </form>
