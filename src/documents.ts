@@ -1,7 +1,16 @@
 import { api } from "./api";
 import type { BusinessProfile } from "./business";
 import { formatCents, today } from "./format";
-import type { AccountBalance, BalanceSheet, CompanySummary, Invoice, ProfitAndLoss, TaxSummary } from "./types";
+import type {
+  AccountBalance,
+  BalanceSheet,
+  CompanySummary,
+  Estimate,
+  Invoice,
+  ProfitAndLoss,
+  SalesOrder,
+  TaxSummary,
+} from "./types";
 
 /** A finished piece of paper: the HTML, and the name it saves under. */
 export interface DocumentFile {
@@ -290,6 +299,152 @@ ${totals}
 ${footer(company)}`;
 
   return { html: wrap(title, body), fileName: `Invoice-${slug(invoice.invoiceNo) || invoice.id}-${invoice.invoiceDate}.html` };
+}
+
+/* ------------------------------------------------------------------ */
+/* Quotes and orders                                                  */
+/* ------------------------------------------------------------------ */
+
+interface PipelinePaper {
+  kind: string;
+  reference: string;
+  when: string;
+  party: InvoiceParty;
+  status: string;
+  dates: Array<{ label: string; value: string }>;
+  lines: Array<{ description: string; qtyHundredths: number; unitPriceCents: number; amountCents: number }>;
+  taxBp: number;
+  subtotalCents: number;
+  taxCents: number;
+  totalCents: number;
+  closing: string;
+  fileName: string;
+}
+
+function pipelineDocument(
+  paper: PipelinePaper,
+  company: CompanySummary | null,
+  profile: BusinessProfile,
+): DocumentFile {
+  const rows = paper.lines
+    .map(
+      (line) => `<tr>
+      <td>${escapeHtml(line.description || "—")}</td>
+      <td class="num">${escapeHtml(quantity(line.qtyHundredths))}</td>
+      <td class="num">${dollars(line.unitPriceCents)}</td>
+      <td class="num">${dollars(line.amountCents)}</td>
+    </tr>`,
+    )
+    .join("");
+
+  const taxPct = paper.taxBp / 100;
+  const taxLabel = taxPct > 0 ? `Tax ${taxPct.toFixed(2).replace(/\.?0+$/, "")}%` : "Tax";
+  const meta = `<div class="meta">
+    <div>
+      <span>Prepared for</span>
+      <strong>${escapeHtml(paper.party.name || "—")}</strong>
+      ${paper.party.address ? `<div class="address muted">${escapeHtml(paper.party.address)}</div>` : ""}
+      ${paper.party.email ? `<div class="muted">${escapeHtml(paper.party.email)}</div>` : ""}
+      ${paper.party.phone ? `<div class="muted">${escapeHtml(paper.party.phone)}</div>` : ""}
+    </div>
+    ${paper.dates
+      .map((entry) => `<div><span>${escapeHtml(entry.label)}</span><strong>${escapeHtml(entry.value)}</strong></div>`)
+      .join("")}
+    <div><span>Status</span><strong><span class="badge">${escapeHtml(paper.status)}</span></strong></div>
+  </div>`;
+
+  const totals = `<div class="totals">
+    <div class="row"><span>Subtotal</span><span class="value">${dollars(paper.subtotalCents)}</span></div>
+    <div class="row"><span>${escapeHtml(taxLabel)}</span><span class="value">${dollars(paper.taxCents)}</span></div>
+    <div class="grand"><span>Total</span><span class="value">${dollars(paper.totalCents)}</span></div>
+  </div>`;
+
+  const body = `${header(company, profile, paper.kind, paper.reference, paper.when)}
+${meta}
+<table>
+  <thead><tr><th>Description</th><th class="num">Qty</th><th class="num">Price</th><th class="num">Amount</th></tr></thead>
+  <tbody>${rows || `<tr><td colspan="4" class="muted">This document has no lines.</td></tr>`}</tbody>
+</table>
+${totals}
+<div class="note"><p>${escapeHtml(paper.closing)}</p></div>
+${footer(company)}`;
+
+  return { html: wrap(`${paper.kind} ${paper.reference}`, body), fileName: paper.fileName };
+}
+
+function partyOf(name: string, customer?: InvoiceParty): InvoiceParty {
+  return customer ?? { name };
+}
+
+export function estimateDocument(
+  estimate: Estimate,
+  company: CompanySummary | null,
+  profile: BusinessProfile,
+  customer?: InvoiceParty,
+): DocumentFile {
+  return pipelineDocument(
+    {
+      kind: "Estimate",
+      reference: estimate.estimateNo,
+      when: `Prepared ${prettyDate(estimate.estimateDate)}`,
+      party: partyOf(estimate.customerName, customer),
+      status: estimate.status,
+      dates: [
+        { label: "Estimate date", value: prettyDate(estimate.estimateDate) },
+        { label: "Valid until", value: prettyDate(estimate.expiryDate) },
+      ],
+      lines: estimate.lines,
+      taxBp: estimate.taxBp,
+      subtotalCents: estimate.subtotalCents,
+      taxCents: estimate.taxCents,
+      totalCents: estimate.totalCents,
+      closing:
+        estimate.convertedInvoiceId
+          ? `Invoiced as ${estimate.invoiceNo ?? "an invoice"}. This estimate is kept for your records.`
+          : estimate.convertedOrderId
+            ? `Ordered as ${estimate.orderNo ?? "a sales order"}.`
+            : estimate.status === "Accepted"
+              ? "Accepted by the customer. Nothing is owed until you invoice it."
+              : "A quote, not a bill. No money is owed and nothing has been posted to your books.",
+      fileName: `Estimate-${slug(estimate.estimateNo) || estimate.id}-${estimate.estimateDate}.html`,
+    },
+    company,
+    profile,
+  );
+}
+
+export function salesOrderDocument(
+  order: SalesOrder,
+  company: CompanySummary | null,
+  profile: BusinessProfile,
+  customer?: InvoiceParty,
+): DocumentFile {
+  return pipelineDocument(
+    {
+      kind: "Sales order",
+      reference: order.orderNo,
+      when: `Ordered ${prettyDate(order.orderDate)}`,
+      party: partyOf(order.customerName, customer),
+      status: order.status,
+      dates: [
+        { label: "Order date", value: prettyDate(order.orderDate) },
+        { label: "Wanted by", value: prettyDate(order.requestedDate) },
+      ],
+      lines: order.lines,
+      taxBp: order.taxBp,
+      subtotalCents: order.subtotalCents,
+      taxCents: order.taxCents,
+      totalCents: order.totalCents,
+      closing: order.invoiceId
+        ? `Invoiced as ${order.invoiceNo ?? "an invoice"}. This order is kept for your records.`
+        : order.status === "Cancelled"
+          ? "This order was cancelled. Nothing is owed and nothing has been posted."
+          : "A confirmed order, not a bill. It becomes money only when you invoice it.",
+      fileName: `Sales-Order-${slug(order.orderNo) || order.id}-${order.orderDate}.html`,
+    },
+    company,
+    profile,
+  );
 }
 
 /* ------------------------------------------------------------------ */

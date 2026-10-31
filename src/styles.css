@@ -569,3 +569,167 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--brass); bor
 .entry-table td, .entry-table th { font-size: 12.5px; }
 .grow { flex: 1; }
 .stack > * + * { margin-top: 0; }
+
+/* ---------------- credit memos ---------------- */
+
+.pick-list { display: flex; flex-direction: column; gap: 6px; }
+.pick-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  padding: 11px 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: var(--paper);
+  color: inherit;
+  text-align: left;
+  font-size: 13px;
+}
+.pick-row:hover { border-color: var(--brass); }
+
+.credit-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 12px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.credit-head-side { display: flex; align-items: flex-end; gap: 12px; }
+
+.inline-field { display: flex; flex-direction: column; gap: 4px; margin: 0; }
+.inline-field span {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  font-weight: 600;
+}
+.credit-line .inline-field { width: 104px; flex-shrink: 0; }
+.credit-head-side .inline-field { width: 150px; }
+
+.credit-lines { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
+.credit-line {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 11px 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: var(--paper);
+}
+.credit-line.over { border-color: var(--rust); background: var(--rust-bg); }
+.credit-line-what { flex: 1; min-width: 0; }
+.credit-line-amount { text-align: right; font-weight: 600; min-width: 90px; }
+
+.credit-total {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: var(--paper);
+}
+.credit-total strong { font-family: var(--font-mono); font-size: 20px; }
+
+.outcome-grid { display: flex; flex-direction: column; gap: 8px; }
+.outcome-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: var(--paper);
+  color: inherit;
+  text-align: left;
+  font: inherit;
+}
+.outcome-card:hover:not(:disabled) { border-color: var(--brass); }
+.outcome-card.selected { border-color: var(--brass-deep); background: var(--line-soft); }
+.outcome-card:disabled { cursor: default; }
+.outcome-radio {
+  width: 14px;
+  height: 14px;
+  margin-top: 3px;
+  border-radius: 50%;
+  border: 1.6px solid var(--muted);
+  flex-shrink: 0;
+}
+.outcome-card.selected .outcome-radio {
+  border-color: var(--brass-deep);
+  background: var(--brass-deep);
+  box-shadow: inset 0 0 0 3px var(--paper);
+}
+.outcome-title { display: block; font-weight: 600; font-size: 13.5px; }
+.outcome-blurb { display: block; font-size: 12.5px; color: var(--ink-soft); }
+.outcome-note { display: block; font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+
+/* ---------------- people and access ---------------- */
+
+.who { display: flex; flex-direction: column; gap: 3px; width: 100%; }
+.who-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--muted);
+}
+.who-name { font-weight: 600; font-size: 13px; }
+.who-role { font-size: 11.5px; color: var(--muted); }
+.who-select { padding: 6px 8px; font-size: 12.5px; }
+.sidebar-foot { flex-direction: column; align-items: stretch; gap: 10px; }
+.sidebar-foot-row { display: flex; align-items: center; justify-content: space-between; }
+
+.role-banner {
+  padding: 10px 14px;
+  margin-bottom: 16px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--brass);
+  border-radius: 8px;
+  background: var(--paper);
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+/* A read only person sees no create buttons at all; the engine refuses the rest. */
+[data-read-only="true"] .toolbar .btn-primary { display: none; }
+
+.user-list { display: flex; flex-direction: column; margin-bottom: 16px; }
+.user-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+.user-who { flex: 1; min-width: 0; }
+.user-row select { width: 116px; flex-shrink: 0; padding: 5px 7px; font-size: 12.5px; }
+
+/* ---------------- payroll preview ---------------- */
+
+.pay-preview {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper);
+}
+
+.pay-preview-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.pay-preview .kv { padding: 4px 0; font-size: 13px; }

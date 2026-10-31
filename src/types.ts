@@ -275,6 +275,8 @@ export interface Invoice {
   subtotalCents: number;
   taxCents: number;
   totalCents: number;
+  /** Everything already credited against this invoice by posted credit memos. */
+  creditedCents: number;
   stockDeducted: boolean;
   lines: InvoiceLine[];
 }
@@ -368,38 +370,131 @@ export interface PurchaseInput {
   lines: PurchaseLineInput[];
 }
 
+export type MaritalStatus = "Single" | "Married";
+
+/** How pay is quoted: an hourly rate, or a yearly salary split into periods. */
+export type PayType = "Hourly" | "Salary";
+
+export type PayFrequency = "Weekly" | "BiWeekly" | "SemiMonthly" | "Monthly";
+
 export interface PayrollRun {
   id: number;
   employee: string;
+  employeeId: number | null;
   payDate: string;
   checkNumber: string;
+  payType: PayType;
+  payFrequency: PayFrequency;
+  /** Checks a year: 52, 26, 24 or 12. Zero for hourly pay. */
+  periodsPerYear: number;
+  /** Hourly rate for an hourly run, 0 for a salaried one. */
   payRateCents: number;
+  /** Annual salary for a salaried run, 0 for an hourly one. */
+  salaryCents: number;
   regularHoursHundredths: number;
   overtimeHoursHundredths: number;
   grossCents: number;
+  maritalStatus: MaritalStatus;
+  allowances: number;
+  extraWithholdingCents: number;
   federalCents: number;
   stateCents: number;
   socialSecurityCents: number;
   medicareCents: number;
   otherDeductionsCents: number;
   totalDeductionsCents: number;
+  /** Additions: reimbursed miles and a per-period allowance. Not wages, so not taxed. */
+  mileageHundredths: number;
+  mileageCents: number;
+  allowanceCents: number;
+  additionsCents: number;
   netCents: number;
+  /** What the check is written for: net pay plus additions. */
+  paidCents: number;
   journalEntryId: number | null;
 }
 
 export interface PayrollInput {
   id?: number | null;
+  employeeId?: number | null;
   employee: string;
   payDate: string;
   checkNumber?: string;
+  payType?: PayType;
+  payFrequency?: PayFrequency;
+  salaryCents?: number;
   payRateCents: number;
   regularHoursHundredths: number;
   overtimeHoursHundredths: number;
-  federalCents?: number;
-  stateCents?: number;
-  socialSecurityCents?: number;
-  medicareCents?: number;
+  maritalStatus?: MaritalStatus;
+  allowances?: number;
+  extraWithholdingCents?: number;
   otherDeductionsCents?: number;
+  payMileage?: boolean;
+  payAllowance?: boolean;
+  allowanceCents?: number;
+}
+
+/**
+ * An employee is payroll data, not a login. W-2 fields say who they are, W-4
+ * fields say how to withhold, and `userId` is only set when they also log time.
+ */
+export interface Employee {
+  id: number;
+  name: string;
+  employeeNo: string;
+  email: string;
+  phone: string;
+  address: string;
+  /** The whole number, so a W-2 can be filled in without retyping it. */
+  ssn: string;
+  /** What lists show: only the last four. */
+  ssnLast4: string;
+  hireDate: string | null;
+  jobTitle: string;
+  userId: number | null;
+  filingStatus: MaritalStatus;
+  allowances: number;
+  extraWithholdingCents: number;
+  payType: PayType;
+  payFrequency: PayFrequency;
+  payRateCents: number;
+  salaryCents: number;
+  allowanceCents: number;
+  mileageReimbursement: boolean;
+  isActive: boolean;
+  createdAt: string;
+}
+
+export interface EmployeeInput {
+  id?: number | null;
+  name: string;
+  employeeNo?: string;
+  email?: string;
+  phone?: string;
+  address?: string;
+  /** Nine digits, or the last four on a file that predates keeping all of it. */
+  ssn?: string;
+  hireDate?: string | null;
+  jobTitle?: string;
+  userId?: number | null;
+  filingStatus?: MaritalStatus;
+  allowances?: number;
+  extraWithholdingCents?: number;
+  payType?: PayType;
+  payFrequency?: PayFrequency;
+  payRateCents?: number;
+  salaryCents?: number;
+  allowanceCents?: number;
+  mileageReimbursement?: boolean;
+  isActive?: boolean;
+}
+
+export interface MileageDue {
+  milesHundredths: number;
+  rateCents: number;
+  amountCents: number;
+  linked: boolean;
 }
 
 export interface AccountBalance {
@@ -466,4 +561,210 @@ export interface DashboardSummary {
 export interface Setting {
   key: string;
   value: string;
+}
+
+/* ------------------------------------------------------------------ *
+ * Credit memos
+ * ------------------------------------------------------------------ */
+
+export type CreditOutcome = "Apply" | "Refund" | "Credit";
+export type CreditStatus = "Draft" | "Posted" | "Void";
+
+export interface CreditMemoLine {
+  id: number;
+  position: number;
+  invoiceLineId: number | null;
+  description: string;
+  qtyHundredths: number;
+  unitPriceCents: number;
+  amountCents: number;
+  inventoryItemId: number | null;
+}
+
+export interface CreditMemo {
+  id: number;
+  memoNo: string;
+  invoiceId: number;
+  invoiceNo: string;
+  customerId: number | null;
+  customerName: string;
+  memoDate: string;
+  reason: string;
+  status: CreditStatus;
+  outcome: CreditOutcome;
+  taxBp: number;
+  subtotalCents: number;
+  taxCents: number;
+  totalCents: number;
+  stockReturned: boolean;
+  createdAt: string;
+  postedAt: string | null;
+  voidedAt: string | null;
+  lines: CreditMemoLine[];
+}
+
+export interface CreditMemoLineInput {
+  invoiceLineId?: number | null;
+  description: string;
+  qtyHundredths: number;
+  unitPriceCents: number;
+  inventoryItemId?: number | null;
+}
+
+export interface CreditMemoInput {
+  id?: number | null;
+  invoiceId: number;
+  memoNo?: string | null;
+  memoDate: string;
+  reason: string;
+  status: CreditStatus;
+  outcome: CreditOutcome;
+  taxBp: number;
+  lines: CreditMemoLineInput[];
+}
+
+/* ------------------------------------------------------------------ *
+ * People and access
+ * ------------------------------------------------------------------ */
+
+export type AccessLevel = "Admin" | "Standard" | "Payroll" | "TimeEntry" | "ReadOnly";
+
+export interface User {
+  id: number;
+  name: string;
+  email: string;
+  access: AccessLevel;
+  isActive: boolean;
+  createdAt: string;
+}
+
+/** Enough to offer someone in the "who is working" picker. */
+export interface Person {
+  id: number;
+  name: string;
+  access: AccessLevel;
+  isActive: boolean;
+}
+
+export interface UserInput {
+  id?: number | null;
+  name: string;
+  email?: string;
+  access: AccessLevel;
+  isActive?: boolean;
+}
+
+export type TimeKind = "Time" | "Mileage";
+
+export interface TimeEntry {
+  id: number;
+  userId: number | null;
+  enteredBy: string;
+  entryDate: string;
+  kind: TimeKind;
+  description: string;
+  customer: string;
+  quantityHundredths: number;
+  rateCents: number;
+  amountCents: number;
+  isBillable: boolean;
+  reimbursedRunId: number | null;
+  createdAt: string;
+}
+
+export interface TimeEntryInput {
+  id?: number | null;
+  userId?: number | null;
+  entryDate: string;
+  kind: TimeKind;
+  description?: string;
+  customer?: string;
+  quantityHundredths: number;
+  rateCents: number;
+  isBillable?: boolean;
+}
+
+/* ------------------------------------------------------------------ *
+ * Quotes and orders: the documents that become an invoice
+ * ------------------------------------------------------------------ */
+
+export type EstimateStatus = "Draft" | "Sent" | "Accepted" | "Declined" | "Expired";
+export type SalesOrderStatus = "Draft" | "Confirmed" | "Fulfilled" | "Cancelled";
+
+/** A line on a quote or an order. Same shape on both, and on an invoice. */
+export interface PipelineLine {
+  id: number;
+  position: number;
+  description: string;
+  qtyHundredths: number;
+  unitPriceCents: number;
+  amountCents: number;
+  inventoryItemId: number | null;
+}
+
+export interface Estimate {
+  id: number;
+  estimateNo: string;
+  customerId: number | null;
+  customerName: string;
+  estimateDate: string;
+  expiryDate: string | null;
+  status: EstimateStatus;
+  taxBp: number;
+  notes: string;
+  subtotalCents: number;
+  taxCents: number;
+  totalCents: number;
+  convertedOrderId: number | null;
+  convertedInvoiceId: number | null;
+  convertedAt: string | null;
+  /** The documents this quote became, named for the list. */
+  orderNo: string | null;
+  invoiceNo: string | null;
+  lines: PipelineLine[];
+}
+
+export interface EstimateInput {
+  id?: number | null;
+  estimateNo?: string | null;
+  customerId?: number | null;
+  estimateDate: string;
+  expiryDate?: string | null;
+  status: EstimateStatus;
+  taxBp: number;
+  notes?: string;
+  lines: InvoiceLineInput[];
+}
+
+export interface SalesOrder {
+  id: number;
+  orderNo: string;
+  customerId: number | null;
+  customerName: string;
+  orderDate: string;
+  requestedDate: string | null;
+  status: SalesOrderStatus;
+  taxBp: number;
+  notes: string;
+  subtotalCents: number;
+  taxCents: number;
+  totalCents: number;
+  invoiceId: number | null;
+  invoiceNo: string | null;
+  estimateId: number | null;
+  estimateNo: string | null;
+  convertedAt: string | null;
+  lines: PipelineLine[];
+}
+
+export interface SalesOrderInput {
+  id?: number | null;
+  orderNo?: string | null;
+  customerId?: number | null;
+  orderDate: string;
+  requestedDate?: string | null;
+  status: SalesOrderStatus;
+  taxBp: number;
+  notes?: string;
+  lines: InvoiceLineInput[];
 }

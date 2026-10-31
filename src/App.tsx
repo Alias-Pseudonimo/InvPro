@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, isDesktop } from "./api";
+import { ACCESS_LABELS, api, isDesktop, setActingUser } from "./api";
 import { errorText } from "./format";
-import type { CompanySummary } from "./types";
+import type { CompanySummary, Person, User } from "./types";
 import DashboardScreen from "./screens/Dashboard";
+import { CreditMemosScreen } from "./screens/Credits";
 import { ExpensesScreen, IncomeScreen } from "./screens/Money";
 import PeopleScreen from "./screens/People";
 import { InvoicesScreen, PurchasesScreen } from "./screens/Paperwork";
+import { EstimatesScreen, SalesOrdersScreen } from "./screens/Sales";
 import { InventoryScreen, PayrollScreen } from "./screens/Stock";
 import ReportsScreen from "./screens/Reports";
 import SettingsScreen from "./screens/Settings";
@@ -15,6 +17,9 @@ type TabId =
   | "dashboard"
   | "income"
   | "invoices"
+  | "estimates"
+  | "orders"
+  | "credits"
   | "customers"
   | "expenses"
   | "purchases"
@@ -44,7 +49,25 @@ const NAV: Array<{ label: string; items: NavItem[] }> = [
     items: [
       { id: "income", label: "Income", title: "Income", sub: "Every dollar coming in" },
       { id: "invoices", label: "Invoices", title: "Invoices", sub: "Bill your customers" },
+      {
+        id: "estimates",
+        label: "Estimates",
+        title: "Estimates",
+        sub: "Quote a job — nothing is owed until it is invoiced",
+      },
+      {
+        id: "orders",
+        label: "Sales orders",
+        title: "Sales orders",
+        sub: "What the customer actually ordered",
+      },
       { id: "customers", label: "Customers", title: "Customers", sub: "Who you bill" },
+      {
+        id: "credits",
+        label: "Credit memos",
+        title: "Credit memos",
+        sub: "Money going back to a customer, and where it went",
+      },
     ],
   },
   {
@@ -59,7 +82,12 @@ const NAV: Array<{ label: string; items: NavItem[] }> = [
     label: "Stock & pay",
     items: [
       { id: "inventory", label: "Inventory", title: "Inventory", sub: "What you have on hand" },
-      { id: "payroll", label: "Payroll", title: "Payroll", sub: "Wages, deductions and net pay" },
+      {
+        id: "payroll",
+        label: "Payroll",
+        title: "Payroll",
+        sub: "Wages, deductions, and the hours and miles behind them",
+      },
     ],
   },
   {
@@ -97,6 +125,8 @@ export default function App() {
   const [theme, setTheme] = useState<"light" | "dark">(initialTheme);
   const [toast, setToast] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [user, setUser] = useState<User | null>(null);
+  const [people, setPeople] = useState<Person[]>([]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -111,11 +141,20 @@ export default function App() {
     }
   }, []);
 
+  const adopt = useCallback(async (record: CompanySummary) => {
+    setCompany(record);
+    const me = await api.currentUser();
+    setActingUser(me);
+    setUser(me);
+  }, []);
+
   const loadCompany = useCallback(async () => {
     try {
       const current = await api.currentCompany();
-      setCompany(current);
-      if (!current) {
+      if (current) {
+        await adopt(current);
+      } else {
+        setCompany(null);
         setCompanies(await api.listCompanies());
         setDirectory(await api.companiesDirectory());
       }
@@ -125,13 +164,62 @@ export default function App() {
     } finally {
       setBooting(false);
     }
-  }, []);
+  }, [adopt]);
 
   useEffect(() => {
     void loadCompany();
   }, [loadCompany]);
 
-  const item = ALL_ITEMS.find((candidate) => candidate.id === tab) ?? ALL_ITEMS[0];
+  const role = user?.access ?? "Admin";
+
+  // The picker is the app's sign-in: everyone can see who is on the file and
+  // choose, because there is no password to check. Access decides what they can
+  // then do, in the engine.
+  useEffect(() => {
+    if (!company) {
+      setPeople([]);
+      return;
+    }
+    void api
+      .listPeople()
+      .then(setPeople)
+      .catch(() => setPeople([]));
+  }, [company, revision]);
+
+  async function switchTo(id: number) {
+    try {
+      const next = await api.switchUser(id);
+      setActingUser(next);
+      setUser(next);
+      setTab(
+        next.access === "TimeEntry" || next.access === "Payroll" ? "payroll" : "dashboard",
+      );
+      changed(`Now working as ${next.name} — ${ACCESS_LABELS[next.access]}`);
+    } catch (err) {
+      setError(errorText(err));
+    }
+  }
+
+  const timeOnly = role === "TimeEntry";
+  // A payroll person opens on payroll and has no other door: their access level
+  // cannot read the books, so offering the tabs would only produce refusals.
+  const payrollOnly = role === "Payroll";
+  const mayPayroll = role === "Admin" || payrollOnly;
+  const activeTab: TabId = timeOnly || payrollOnly ? "payroll" : tab;
+  // A time entry person sees one door, and it opens onto their own sheet; the
+  // payroll door is only drawn for the people whose level can open it.
+  const groups = NAV.map((group) => ({
+    ...group,
+    items: group.items.filter((entry) => {
+      if (timeOnly || payrollOnly) return entry.id === "payroll";
+      if (entry.id === "payroll") return mayPayroll;
+      return true;
+    }),
+  })).filter((group) => group.items.length > 0);
+  const base = ALL_ITEMS.find((candidate) => candidate.id === activeTab) ?? ALL_ITEMS[0];
+  const item = timeOnly
+    ? { ...base, label: "Time & mileage", title: "Time & mileage", sub: "Your hours and miles" }
+    : base;
 
   if (booting) {
     return <div className="boot">Opening your books…</div>;
@@ -163,7 +251,7 @@ export default function App() {
               const name = String(form.get("name") ?? "").trim();
               try {
                 const created = await api.createCompany({ name });
-                setCompany(created);
+                await adopt(created);
                 changed("Company created");
               } catch (err) {
                 setError(errorText(err));
@@ -189,7 +277,7 @@ export default function App() {
                   className="file-row"
                   onClick={async () => {
                     try {
-                      setCompany(await api.openCompany(record.path));
+                      await adopt(await api.openCompany(record.path));
                       changed(`Opened ${record.name}`);
                     } catch (err) {
                       setError(errorText(err));
@@ -211,7 +299,7 @@ export default function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" data-read-only={role === "ReadOnly" ? "true" : "false"}>
       <aside className="sidebar">
         <div className="brand">
           <div className="mark">
@@ -222,14 +310,14 @@ export default function App() {
         </div>
 
         <nav className="tabs" aria-label="Sections">
-          {NAV.map((group) => (
+          {groups.map((group) => (
             <div className="tab-group" key={group.label}>
               <div className="tab-label">{group.label}</div>
               {group.items.map((navItem) => (
                 <button
                   key={navItem.id}
                   type="button"
-                  className={`tab ${tab === navItem.id ? "active" : ""}`}
+                  className={`tab ${activeTab === navItem.id ? "active" : ""}`}
                   onClick={() => setTab(navItem.id)}
                 >
                   {navItem.label}
@@ -240,14 +328,40 @@ export default function App() {
         </nav>
 
         <div className="sidebar-foot">
-          <span className="muted small">{company.baseCurrency}</span>
-          <button
-            type="button"
-            className="theme-toggle"
-            onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-            title="Toggle light and dark"
-            aria-label="Toggle light and dark"
-          />
+          {user && (
+            <div className="who">
+              <div className="who-label">Working as</div>
+              {people.length > 0 ? (
+                <select
+                  className="who-select"
+                  value={user.id}
+                  onChange={(event) => void switchTo(Number(event.target.value))}
+                  aria-label="Switch the person working"
+                >
+                  {people
+                    .filter((person) => person.isActive || person.id === user.id)
+                    .map((person) => (
+                      <option key={person.id} value={person.id}>
+                        {person.name} — {ACCESS_LABELS[person.access]}
+                      </option>
+                    ))}
+                </select>
+              ) : (
+                <div className="who-name">{user.name}</div>
+              )}
+              <div className="who-role">{ACCESS_LABELS[user.access]}</div>
+            </div>
+          )}
+          <div className="sidebar-foot-row">
+            <span className="muted small">{company.baseCurrency}</span>
+            <button
+              type="button"
+              className="theme-toggle"
+              onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+              title="Toggle light and dark"
+              aria-label="Toggle light and dark"
+            />
+          </div>
         </div>
       </aside>
 
@@ -263,28 +377,42 @@ export default function App() {
         </header>
 
         <main className="content">
-          {tab === "dashboard" && <DashboardScreen revision={revision} go={(next) => setTab(next as TabId)} />}
-          {tab === "income" && <IncomeScreen revision={revision} changed={changed} />}
-          {tab === "invoices" && <InvoicesScreen revision={revision} changed={changed} />}
-          {tab === "customers" && <PeopleScreen kind="customers" revision={revision} changed={changed} />}
-          {tab === "expenses" && <ExpensesScreen revision={revision} changed={changed} />}
-          {tab === "purchases" && <PurchasesScreen revision={revision} changed={changed} />}
-          {tab === "vendors" && <PeopleScreen kind="vendors" revision={revision} changed={changed} />}
-          {tab === "inventory" && <InventoryScreen revision={revision} changed={changed} />}
-          {tab === "payroll" && <PayrollScreen revision={revision} changed={changed} />}
-          {tab === "pl" && <ReportsScreen mode="pl" revision={revision} />}
-          {tab === "balance" && <ReportsScreen mode="balance" revision={revision} />}
-          {tab === "tax" && <ReportsScreen mode="tax" revision={revision} />}
-          {tab === "ledger" && <LedgerScreen revision={revision} changed={changed} />}
-          {tab === "settings" && (
+          {role === "ReadOnly" && (
+            <div className="role-banner">
+              <strong>Read only.</strong> You can look through everything and run reports, but nothing here can be created
+              or edited. An admin can change this in Settings, under Users and access.
+            </div>
+          )}
+          {activeTab === "dashboard" && <DashboardScreen revision={revision} go={(next) => setTab(next as TabId)} />}
+          {activeTab === "income" && <IncomeScreen revision={revision} changed={changed} />}
+          {activeTab === "invoices" && <InvoicesScreen revision={revision} changed={changed} />}
+          {activeTab === "estimates" && <EstimatesScreen revision={revision} changed={changed} />}
+          {activeTab === "orders" && <SalesOrdersScreen revision={revision} changed={changed} />}
+          {activeTab === "credits" && <CreditMemosScreen revision={revision} changed={changed} />}
+          {activeTab === "customers" && <PeopleScreen kind="customers" revision={revision} changed={changed} />}
+          {activeTab === "expenses" && <ExpensesScreen revision={revision} changed={changed} />}
+          {activeTab === "purchases" && <PurchasesScreen revision={revision} changed={changed} />}
+          {activeTab === "vendors" && <PeopleScreen kind="vendors" revision={revision} changed={changed} />}
+          {activeTab === "inventory" && <InventoryScreen revision={revision} changed={changed} />}
+          {activeTab === "payroll" && user && (
+            <PayrollScreen revision={revision} changed={changed} me={user} />
+          )}
+          {activeTab === "pl" && <ReportsScreen mode="pl" revision={revision} />}
+          {activeTab === "balance" && <ReportsScreen mode="balance" revision={revision} />}
+          {activeTab === "tax" && <ReportsScreen mode="tax" revision={revision} />}
+          {activeTab === "ledger" && <LedgerScreen revision={revision} changed={changed} />}
+          {activeTab === "settings" && (
             <SettingsScreen
               revision={revision}
               changed={changed}
               company={company}
+              me={user}
               onCloseCompany={async () => {
                 try {
                   await api.closeCompany();
                   setCompany(null);
+                  setActingUser(null);
+                  setUser(null);
                   setCompanies(await api.listCompanies());
                   changed("Company closed");
                 } catch (err) {

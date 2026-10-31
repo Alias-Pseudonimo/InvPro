@@ -13,10 +13,17 @@ import type {
   BalanceSheet,
   ChainReport,
   CompanySummary,
+  CreditMemo,
+  CreditMemoInput,
+  CreditMemoLine,
   Customer,
   DashboardSummary,
+  Employee,
+  EmployeeInput,
   EntryDetail,
   EntrySummary,
+  Estimate,
+  EstimateInput,
   ExpenseInput,
   ExpenseRecord,
   IncomeInput,
@@ -28,9 +35,12 @@ import type {
   InvoiceLine,
   JournalEntryInput,
   LedgerHealth,
+  MileageDue,
   PartyInput,
+  PayFrequency,
   PayrollInput,
   PayrollRun,
+  PayType,
   ProfitAndLoss,
   Purchase,
   PurchaseInput,
@@ -38,10 +48,17 @@ import type {
   RecurringFrequency,
   RecurringInvoice,
   RecurringInvoiceInput,
+  SalesOrder,
+  SalesOrderInput,
   TaxSummary,
+  TimeEntry,
+  TimeEntryInput,
   TrialBalanceReport,
+  User,
+  UserInput,
   Vendor,
 } from "./types";
+import { PAY_PERIODS } from "./format";
 
 const CHART: Array<[string, string, AccountType, string]> = [
   ["1000", "Checking", "ASSET", "Bank"],
@@ -58,6 +75,7 @@ const CHART: Array<[string, string, AccountType, string]> = [
   ["6100", "Materials", "EXPENSE", "Operating Expense"],
   ["6200", "Vehicle & Fuel", "EXPENSE", "Operating Expense"],
   ["6300", "Payroll Expense", "EXPENSE", "Payroll"],
+  ["6310", "Employee Reimbursements", "EXPENSE", "Payroll"],
   ["6400", "Insurance", "EXPENSE", "Operating Expense"],
   ["6500", "Equipment Rental", "EXPENSE", "Operating Expense"],
 ];
@@ -85,6 +103,13 @@ interface State {
   /* Invoices the mock created from an income record, removed with it. */
   autoInvoices: number[];
   recurring: RecurringInvoice[];
+  estimates: Estimate[];
+  salesOrders: SalesOrder[];
+  creditMemos: CreditMemo[];
+  users: User[];
+  currentUserId: number | null;
+  timeEntries: TimeEntry[];
+  employees: Employee[];
   purchases: Purchase[];
   payroll: PayrollRun[];
   settings: Record<string, string>;
@@ -109,6 +134,13 @@ function emptyState(): State {
     invoices: [],
     autoInvoices: [],
     recurring: [],
+    estimates: [],
+    salesOrders: [],
+    creditMemos: [],
+    users: [],
+    currentUserId: null,
+    timeEntries: [],
+    employees: [],
     purchases: [],
     payroll: [],
     settings: { currency: "USD", invoice_income_account: "Sales Revenue" },
@@ -136,6 +168,57 @@ function addMonths(date: string, months: number): string {
   const lastDay = new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth() + 1, 0)).getUTCDate();
   value.setUTCDate(Math.min(day, lastDay));
   return value.toISOString().slice(0, 10);
+}
+
+type MockMarital = "Single" | "Married";
+
+function settingNumber(key: string, fallback: number): number {
+  const value = Number(state.settings[key]);
+  return state.settings[key] !== undefined && Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+/** The preview stand-in for the engine's withholding estimate. Every rate comes
+ *  from settings, exactly like the engine, so the demo never shows a different
+ *  net pay than the desktop app. */
+function withholding(gross: number, marital: MockMarital, allowances: number, extra = 0) {
+  const apply = (amount: number, bp: number) => Math.round((amount * bp) / 10_000);
+  const allowanceValue = settingNumber("payroll_allowance_cents", 19_400);
+  const federalBp = marital === "Married"
+    ? settingNumber("payroll_federal_married_bp", 800)
+    : settingNumber("payroll_federal_single_bp", 1_200);
+  const base = Math.max(0, gross - allowanceValue * allowances);
+  return {
+    federal: Math.min(gross, apply(base, federalBp) + extra),
+    state: apply(gross, settingNumber("payroll_state_bp", 400)),
+    social: apply(gross, settingNumber("payroll_social_security_bp", 620)),
+    medicare: apply(gross, settingNumber("payroll_medicare_bp", 145)),
+  };
+}
+
+/** Miles belong to the employee who logged them: by user link when there is
+ *  one, otherwise by the name on the sheet. */
+function mileageBelongsTo(entry: TimeEntry, employee: Employee): boolean {
+  if (entry.kind !== "Mileage") return false;
+  if (employee.userId !== null) return entry.userId === employee.userId;
+  return entry.enteredBy.toLowerCase() === employee.name.toLowerCase();
+}
+
+function mileageFor(employee: Employee | null, includingRun: number | null = null): MileageDue {
+  const rateCents = settingNumber("payroll_mileage_rate_cents", 67);
+  if (!employee) return { milesHundredths: 0, rateCents, amountCents: 0, linked: false };
+  const milesHundredths = state.timeEntries
+    .filter(
+      (entry) =>
+        mileageBelongsTo(entry, employee) &&
+        (entry.reimbursedRunId === null || entry.reimbursedRunId === includingRun),
+    )
+    .reduce((sum, entry) => sum + entry.quantityHundredths, 0);
+  return {
+    milesHundredths,
+    rateCents,
+    amountCents: Math.round((milesHundredths * rateCents) / 100),
+    linked: employee.userId !== null || milesHundredths > 0,
+  };
 }
 
 function advance(date: string, frequency: RecurringFrequency): string {
@@ -169,7 +252,7 @@ function seedCompany(name: string, currency: string): CompanySummary {
     fileId: `preview-${Date.now()}`,
     baseCurrency: currency,
     fiscalYearStartMonth: 1,
-    schemaVersion: 2,
+    schemaVersion: 7,
     sizeBytes: 61_440,
     modifiedAt: String(Math.floor(Date.now() / 1000)),
   };
@@ -379,6 +462,7 @@ function seed() {
       subtotalCents: subtotal,
       taxCents: tax,
       totalCents: subtotal + tax,
+      creditedCents: 0,
       stockDeducted: status !== "Draft",
       lines,
     };
@@ -386,7 +470,7 @@ function seed() {
     return record;
   };
 
-  invoice("INV-1005", alameda, "2026-07-15", "2026-08-14", "Sent", [
+  const phase2 = invoice("INV-1005", alameda, "2026-07-15", "2026-08-14", "Sent", [
     line("Deck rebuild — phase 2 labor", 1, 320_000, null),
     line("Sealant & finishing", 1, 60_000, null),
   ], 0);
@@ -424,35 +508,6 @@ function seed() {
   };
   purchase();
 
-  const payRun = (employee: string, date: string, rate: number, regular: number, overtime: number, deductions: [number, number, number, number], check: string) => {
-    const gross = Math.round(rate * regular + rate * 1.5 * overtime);
-    const [federal, stateTax, social, medicare] = deductions;
-    const totalDeductions = federal + stateTax + social + medicare;
-    const record: PayrollRun = {
-      id: id("payroll"),
-      employee,
-      payDate: date,
-      checkNumber: check,
-      payRateCents: rate,
-      regularHoursHundredths: regular * 100,
-      overtimeHoursHundredths: overtime * 100,
-      grossCents: gross,
-      federalCents: federal,
-      stateCents: stateTax,
-      socialSecurityCents: social,
-      medicareCents: medicare,
-      otherDeductionsCents: 0,
-      totalDeductionsCents: totalDeductions,
-      netCents: gross - totalDeductions,
-      journalEntryId: id("entry"),
-    };
-    state.payroll.push(record);
-    return record;
-  };
-
-  payRun("J. Alvarez", "2026-07-31", 4_000, 80, 5, [42_000, 14_000, 21_740, 5_085], "1058");
-  payRun("T. Okafor", "2026-07-31", 3_500, 80, 0, [33_600, 11_200, 17_360, 4_060], "1059");
-
   state.settings.company_name = "Riverbend Contracting LLC";
   state.settings.business_address = "1420 Harbor Way\nAlameda, CA 94501";
   state.settings.business_phone = "(510) 555-0142";
@@ -462,6 +517,363 @@ function seed() {
   state.settings.receivable_account = String(state.accounts.find((account) => account.number === "1100")?.id ?? 2);
   state.settings.payable_account = String(state.accounts.find((account) => account.number === "2000")?.id ?? 3);
   state.settings.sales_tax_account = String(state.accounts.find((account) => account.number === "2200")?.id ?? 4);
+
+  // People, with one of each access level so the preview shows the differences.
+  const person = (name: string, email: string, access: User["access"]): User => {
+    const record: User = {
+      id: id("user"),
+      name,
+      email,
+      access,
+      isActive: true,
+      createdAt: new Date().toISOString(),
+    };
+    state.users.push(record);
+    return record;
+  };
+  const owner = person("Owner", "", "Admin");
+  const sam = person("Sam Okafor", "sam@riverbend.example", "Standard");
+  person("Priya Raman", "priya@riverbend.example", "Payroll");
+  const rae = person("Rae Lin", "rae@riverbend.example", "TimeEntry");
+  person("Dana Whitfield", "dana@bookkeeping.example", "ReadOnly");
+  state.currentUserId = owner.id;
+
+  const timeEntry = (
+    who: User,
+    date: string,
+    kind: TimeEntry["kind"],
+    description: string,
+    customer: string,
+    quantity: number,
+    rate: number,
+    billable = true,
+  ): TimeEntry => {
+    const quantityHundredths = Math.round(quantity * 100);
+    const record: TimeEntry = {
+      id: id("time"),
+      userId: who.id,
+      enteredBy: who.name,
+      entryDate: date,
+      kind,
+      description,
+      customer,
+      quantityHundredths,
+      rateCents: rate,
+      amountCents: Math.round((quantityHundredths * rate) / 100),
+      isBillable: billable,
+      reimbursedRunId: null,
+      createdAt: new Date().toISOString(),
+    };
+    state.timeEntries.push(record);
+    return record;
+  };
+  timeEntry(rae, "2026-08-04", "Time", "Fence install — Castellano", "Castellano Residence", 6.5, 8_500);
+  timeEntry(rae, "2026-08-05", "Mileage", "Site visit round trip", "Alameda Property Group", 42, 67);
+  timeEntry(sam, "2026-08-06", "Time", "Books cleanup", "", 3, 6_500, false);
+
+  // The payroll roster. None of these people needs an account: only Rae Lin
+  // also logs time, so she is the one linked to a user.
+  const hire = (
+    name: string,
+    rate: number,
+    marital: MockMarital,
+    allowances: number,
+    extra: {
+      userId?: number;
+      allowanceCents?: number;
+      mileageReimbursement?: boolean;
+      ssn?: string;
+      payType?: PayType;
+      payFrequency?: PayFrequency;
+      salaryCents?: number;
+    } = {},
+  ): Employee => {
+    const ssn = extra.ssn ?? "";
+    const record: Employee = {
+      id: id("employee"),
+      name,
+      employeeNo: `E-00${state.employees.length + 1}`,
+      email: "",
+      phone: "",
+      address: "",
+      ssn,
+      ssnLast4: ssn.slice(-4),
+      hireDate: "2025-04-01",
+      jobTitle: "",
+      userId: extra.userId ?? null,
+      filingStatus: marital,
+      allowances,
+      extraWithholdingCents: 0,
+      payType: extra.payType ?? "Hourly",
+      payFrequency: extra.payFrequency ?? "BiWeekly",
+      payRateCents: rate,
+      salaryCents: extra.salaryCents ?? 0,
+      allowanceCents: extra.allowanceCents ?? 0,
+      mileageReimbursement: extra.mileageReimbursement ?? false,
+      isActive: true,
+      createdAt: new Date().toISOString(),
+    };
+    state.employees.push(record);
+    return record;
+  };
+  const alvarez = hire("J. Alvarez", 4_000, "Married", 2, {
+    ssn: "412884821",
+  });
+  // Okafor is salaried: $91,000 a year every two weeks is the same $3,500 a
+  // period the hourly rate used to pay, so the history reads the same.
+  const okafor = hire("T. Okafor", 0, "Single", 0, {
+    ssn: "556901334",
+    payType: "Salary",
+    payFrequency: "BiWeekly",
+    salaryCents: 9_100_000,
+  });
+  const lin = hire("Rae Lin", 4_200, "Single", 0, {
+    userId: rae.id,
+    allowanceCents: 5_000,
+    mileageReimbursement: true,
+    ssn: "601445482",
+  });
+
+  const payRun = (
+    person: Employee,
+    date: string,
+    rate: number,
+    regular: number,
+    overtime: number,
+    marital: MockMarital,
+    allowances: number,
+    check: string,
+    additions: { mileageHundredths?: number; mileageCents?: number; allowanceCents?: number } = {},
+    basis: { payType?: PayType; payFrequency?: PayFrequency; salaryCents?: number } = {},
+  ) => {
+    const payType = basis.payType ?? "Hourly";
+    const payFrequency = basis.payFrequency ?? person.payFrequency;
+    const salaryCents = payType === "Salary" ? basis.salaryCents ?? person.salaryCents : 0;
+    const gross = payType === "Salary"
+      ? Math.round(salaryCents / PAY_PERIODS[payFrequency])
+      : Math.round(rate * regular + rate * 1.5 * overtime);
+    const tax = withholding(gross, marital, allowances);
+    const totalDeductions = tax.federal + tax.state + tax.social + tax.medicare;
+    const mileageCents = additions.mileageCents ?? 0;
+    const allowanceCents = additions.allowanceCents ?? 0;
+    const net = gross - totalDeductions;
+    const record: PayrollRun = {
+      id: id("payroll"),
+      employee: person.name,
+      employeeId: person.id,
+      payDate: date,
+      checkNumber: check,
+      payType,
+      payFrequency,
+      periodsPerYear: payType === "Salary" ? PAY_PERIODS[payFrequency] : 0,
+      payRateCents: payType === "Salary" ? 0 : rate,
+      salaryCents,
+      regularHoursHundredths: payType === "Salary" ? 0 : regular * 100,
+      overtimeHoursHundredths: payType === "Salary" ? 0 : overtime * 100,
+      grossCents: gross,
+      maritalStatus: marital,
+      allowances,
+      extraWithholdingCents: 0,
+      federalCents: tax.federal,
+      stateCents: tax.state,
+      socialSecurityCents: tax.social,
+      medicareCents: tax.medicare,
+      otherDeductionsCents: 0,
+      totalDeductionsCents: totalDeductions,
+      mileageHundredths: additions.mileageHundredths ?? 0,
+      mileageCents,
+      allowanceCents,
+      additionsCents: mileageCents + allowanceCents,
+      netCents: net,
+      paidCents: net + mileageCents + allowanceCents,
+      journalEntryId: id("entry"),
+    };
+    state.payroll.push(record);
+    return record;
+  };
+
+  payRun(alvarez, "2026-07-31", 4_000, 80, 5, "Married", 2, "1058");
+  payRun(okafor, "2026-07-31", 0, 0, 0, "Single", 0, "1059", {}, {
+    payType: "Salary",
+    payFrequency: "BiWeekly",
+    salaryCents: 9_100_000,
+  });
+
+  // One run that paid mileage and an allowance, so the preview shows additions.
+  const mileageCents = Math.round(
+    (state.timeEntries
+      .filter((entry) => mileageBelongsTo(entry, lin))
+      .reduce((sum, entry) => sum + entry.quantityHundredths, 0) * 67) / 100,
+  );
+  const paidLin = payRun(lin, "2026-08-07", 4_200, 80, 0, "Single", 0, "1060", {
+    mileageHundredths: state.timeEntries
+      .filter((entry) => mileageBelongsTo(entry, lin))
+      .reduce((sum, entry) => sum + entry.quantityHundredths, 0),
+    mileageCents,
+    allowanceCents: 5_000,
+  });
+  for (const entry of state.timeEntries) {
+    if (mileageBelongsTo(entry, lin)) entry.reimbursedRunId = paidLin.id;
+  }
+
+  // Miles logged after that run are still waiting for the next one.
+  timeEntry(rae, "2026-08-12", "Mileage", "Material pickup", "Castellano Residence", 18, 67);
+
+  // The paperwork before the invoice: one quote still out with the customer and
+  // one quote that has already become a confirmed order.
+  const quoteLines = (rows: Array<[string, number, number]>): Estimate["lines"] =>
+    rows.map(([description, qty, price], index) => ({
+      id: id("estimate_line"),
+      position: index + 1,
+      description,
+      qtyHundredths: Math.round(qty * 100),
+      unitPriceCents: price,
+      amountCents: Math.round(qty * price),
+      inventoryItemId: null,
+    }));
+
+  const acceptedQuote = quoteLines([
+    ["Gate install — hardware", 2, 8_500],
+    ["Gate install — labour", 1, 52_000],
+  ]);
+  const acceptedTotals = pipelineTotals(acceptedQuote, 0);
+  const quoteId = id("estimate");
+  const orderLines: SalesOrder["lines"] = acceptedQuote.map((line, index) => ({
+    ...line,
+    id: id("order_line"),
+    position: index + 1,
+  }));
+  const order: SalesOrder = {
+    id: id("order"),
+    orderNo: "SO-1001",
+    customerId: state.customers[3].id,
+    customerName: state.customers[3].name,
+    orderDate: "2026-08-02",
+    requestedDate: "2026-08-20",
+    status: "Confirmed",
+    taxBp: 0,
+    notes: "Customer confirmed the gate quote",
+    subtotalCents: acceptedTotals.subtotal,
+    taxCents: acceptedTotals.tax,
+    totalCents: acceptedTotals.total,
+    invoiceId: null,
+    invoiceNo: null,
+    estimateId: null,
+    estimateNo: null,
+    convertedAt: null,
+    lines: orderLines,
+  };
+  state.salesOrders.push(order);
+
+  const accepted: Estimate = {
+    id: quoteId,
+    estimateNo: "EST-0999",
+    customerId: order.customerId,
+    customerName: order.customerName,
+    estimateDate: "2026-07-28",
+    expiryDate: "2026-08-28",
+    status: "Accepted",
+    taxBp: 0,
+    notes: String(state.customers[3].notes ?? ""),
+    subtotalCents: acceptedTotals.subtotal,
+    taxCents: acceptedTotals.tax,
+    totalCents: acceptedTotals.total,
+    convertedOrderId: order.id,
+    convertedInvoiceId: null,
+    convertedAt: new Date().toISOString(),
+    orderNo: order.orderNo,
+    invoiceNo: null,
+    lines: acceptedQuote,
+  };
+  state.estimates.push(accepted);
+  order.estimateId = accepted.id;
+  order.estimateNo = accepted.estimateNo;
+
+  const openLines = quoteLines([
+    ["Deck rebuild — phase 3 labour", 1, 320_000],
+    ["Composite decking & fixings", 1, 64_000],
+  ]);
+  const openTotals = pipelineTotals(openLines, 0);
+  state.estimates.push({
+    id: id("estimate"),
+    estimateNo: "EST-1000",
+    customerId: state.customers[0].id,
+    customerName: state.customers[0].name,
+    estimateDate: "2026-08-06",
+    expiryDate: "2026-09-05",
+    status: "Sent",
+    taxBp: 0,
+    notes: "Sent by email — waiting to hear back",
+    subtotalCents: openTotals.subtotal,
+    taxCents: openTotals.tax,
+    totalCents: openTotals.total,
+    convertedOrderId: null,
+    convertedInvoiceId: null,
+    convertedAt: null,
+    orderNo: null,
+    invoiceNo: null,
+    lines: openLines,
+  });
+
+  // One credit memo already posted against INV-1005, and one still a draft.
+  const creditLine = (invoiceLine: InvoiceLine, qty: number): CreditMemoLine => ({
+    id: id("credit_line"),
+    position: 1,
+    invoiceLineId: invoiceLine.id,
+    description: invoiceLine.description,
+    qtyHundredths: Math.round(qty * 100),
+    unitPriceCents: invoiceLine.unitPriceCents,
+    amountCents: Math.round((qty * invoiceLine.unitPriceCents)),
+    inventoryItemId: invoiceLine.inventoryItemId,
+  });
+  const finish = creditLine(phase2.lines[1], 1);
+  finish.position = 1;
+  state.creditMemos.push({
+    id: id("credit"),
+    memoNo: "CM-1001",
+    invoiceId: phase2.id,
+    invoiceNo: phase2.invoiceNo,
+    customerId: phase2.customerId,
+    customerName: phase2.customerName,
+    memoDate: "2026-07-28",
+    reason: "Service not delivered",
+    status: "Posted",
+    outcome: "Apply",
+    taxBp: 0,
+    subtotalCents: finish.amountCents,
+    taxCents: 0,
+    totalCents: finish.amountCents,
+    stockReturned: false,
+    createdAt: new Date().toISOString(),
+    postedAt: new Date().toISOString(),
+    voidedAt: null,
+    lines: [finish],
+  });
+  phase2.creditedCents = finish.amountCents;
+}
+
+/** Preview stand-in for the engine's "already credited" figure. */
+function creditedOn(invoiceId: number, excluding?: number | null): number {
+  return state.creditMemos
+    .filter((memo) => memo.invoiceId === invoiceId && memo.status === "Posted" && memo.id !== excluding)
+    .reduce((sum, memo) => sum + memo.totalCents, 0);
+}
+
+function actingUser(): User {
+  const user = state.users.find((candidate) => candidate.id === state.currentUserId)
+    ?? state.users.find((candidate) => candidate.isActive);
+  if (!user) throw new Error("this company file has no active user");
+  return user;
+}
+
+function restock(memo: CreditMemo, direction: 1 | -1) {
+  for (const line of memo.lines) {
+    if (!line.inventoryItemId) continue;
+    const item = state.items.find((candidate) => candidate.id === line.inventoryItemId);
+    if (!item) continue;
+    item.qtyHundredths = Math.max(0, item.qtyHundredths + direction * line.qtyHundredths);
+    item.stockValueCents = Math.round((item.qtyHundredths * item.unitCostCents) / 100);
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -474,12 +886,12 @@ function totals() {
   const income = state.income.reduce((sum, record) => sum + record.amountCents, 0) + invoiceRevenue;
   const expenses = state.expenses.reduce((sum, record) => sum + record.totalCents, 0)
     + state.purchases.reduce((sum, record) => sum + record.totalCents, 0)
-    + state.payroll.reduce((sum, record) => sum + record.grossCents, 0);
+    + state.payroll.reduce((sum, record) => sum + record.grossCents + record.additionsCents, 0);
   const cash = state.income.filter((record) => record.isPaid).reduce((sum, record) => sum + record.totalCents, 0)
     + state.invoices.filter((invoice) => invoice.status === "Paid").reduce((sum, invoice) => sum + invoice.totalCents, 0)
     - state.expenses.filter((record) => record.isPaid).reduce((sum, record) => sum + record.totalCents, 0)
     - state.purchases.filter((record) => record.isPaid).reduce((sum, record) => sum + record.totalCents, 0)
-    - state.payroll.reduce((sum, record) => sum + record.netCents, 0);
+    - state.payroll.reduce((sum, record) => sum + record.paidCents, 0);
   const receivable = state.income.filter((record) => !record.isPaid).reduce((sum, record) => sum + record.totalCents, 0)
     + state.invoices.filter((invoice) => invoice.status === "Sent").reduce((sum, invoice) => sum + invoice.totalCents, 0);
   const payable = state.expenses.filter((record) => !record.isPaid).reduce((sum, record) => sum + record.totalCents, 0)
@@ -511,6 +923,9 @@ function profitAndLoss(): ProfitAndLoss {
     ...state.expenses.map((record) => ({ category: record.category, amountCents: record.totalCents })),
     ...state.purchases.map((record) => ({ category: record.category, amountCents: record.totalCents })),
     ...state.payroll.map((record) => ({ category: "Payroll Expense", amountCents: record.grossCents })),
+    ...state.payroll
+      .filter((record) => record.additionsCents > 0)
+      .map((record) => ({ category: "Employee Reimbursements", amountCents: record.additionsCents })),
   ];
   const income = groupByCategory(incomeRows);
   const expenses = groupByCategory(expenseRows);
@@ -587,6 +1002,118 @@ function trialBalance(): TrialBalanceReport {
 
 function requireOpen() {
   if (!state.active) throw new Error("no company file is open");
+}
+
+function today(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+/** One place that writes an invoice, so a conversion from a quote or an order
+ *  produces exactly the same record as the invoice screen does. */
+function writeInvoice(input: InvoiceInput): Invoice {
+  const lines: InvoiceLine[] = input.lines.map((line, index) => ({
+    id: id("invoice_line"),
+    position: index + 1,
+    description: line.description,
+    qtyHundredths: line.qtyHundredths,
+    unitPriceCents: line.unitPriceCents,
+    amountCents: Math.round((line.qtyHundredths * line.unitPriceCents) / 100),
+    inventoryItemId: line.inventoryItemId ?? null,
+  }));
+  const subtotal = lines.reduce((sum, line) => sum + line.amountCents, 0);
+  const tax = Math.round((subtotal * input.taxBp) / 10_000);
+  const customer = state.customers.find((candidate) => candidate.id === input.customerId);
+  const existing = state.invoices.find((candidate) => candidate.id === input.id);
+  const record: Invoice = {
+    id: input.id ?? id("invoice"),
+    invoiceNo: input.invoiceNo?.trim() || `INV-${1000 + state.invoices.length + 1}`,
+    customerId: input.customerId ?? null,
+    customerName: customer?.name ?? "",
+    invoiceDate: input.invoiceDate,
+    dueDate: input.dueDate ?? null,
+    status: input.status,
+    taxBp: input.taxBp,
+    subtotalCents: subtotal,
+    taxCents: tax,
+    totalCents: subtotal + tax,
+    creditedCents: existing?.creditedCents ?? 0,
+    stockDeducted: input.status !== "Draft",
+    lines,
+  };
+  record.creditedCents = creditedOn(record.id);
+  if (existing) {
+    // Put back what the old version took out, then apply the new version.
+    if (existing.stockDeducted) {
+      for (const line of existing.lines) {
+        if (!line.inventoryItemId) continue;
+        const item = state.items.find((candidate) => candidate.id === line.inventoryItemId);
+        if (item) item.qtyHundredths += line.qtyHundredths;
+      }
+    }
+    Object.assign(existing, record);
+  } else {
+    state.invoices.push(record);
+  }
+  if (record.status !== "Draft") {
+    for (const line of lines) {
+      if (!line.inventoryItemId) continue;
+      const item = state.items.find((candidate) => candidate.id === line.inventoryItemId);
+      if (item) item.qtyHundredths = Math.max(0, item.qtyHundredths - line.qtyHundredths);
+    }
+  }
+  auditRow(existing ? "UPDATE" : "INSERT", "invoices", record.id, record);
+  return record;
+}
+
+/** Ditto for the two documents that lead to an invoice. */
+function writePipelineLines(input: { description: string; qtyHundredths: number; unitPriceCents: number; inventoryItemId?: number | null }[]) {
+  return input.map((line, index) => ({
+    id: id("pipeline_line"),
+    position: index + 1,
+    description: line.description,
+    qtyHundredths: line.qtyHundredths,
+    unitPriceCents: line.unitPriceCents,
+    amountCents: Math.round((line.qtyHundredths * line.unitPriceCents) / 100),
+    inventoryItemId: line.inventoryItemId ?? null,
+  }));
+}
+
+function nextSeries(prefix: string, numbers: string[]): string {
+  let highest = 1000;
+  for (const number of numbers) {
+    const value = Number((number.split("-").pop() ?? "").trim());
+    if (Number.isFinite(value)) highest = Math.max(highest, value);
+  }
+  return `${prefix}-${highest + 1}`;
+}
+
+function pipelineTotals(lines: { amountCents: number }[], taxBp: number) {
+  const subtotal = lines.reduce((sum, line) => sum + line.amountCents, 0);
+  const tax = Math.round((subtotal * taxBp) / 10_000);
+  return { subtotal, tax, total: subtotal + tax };
+}
+
+function invoiceInputFrom(
+  customerId: number | null,
+  date: string,
+  taxBp: number,
+  lines: { description: string; qtyHundredths: number; unitPriceCents: number; inventoryItemId: number | null }[],
+): InvoiceInput {
+  return {
+    id: null,
+    invoiceNo: null,
+    customerId,
+    invoiceDate: date,
+    dueDate: null,
+    status: "Draft",
+    taxBp,
+    lines: lines.map((line) => ({
+      description: line.description,
+      qtyHundredths: line.qtyHundredths,
+      unitPriceCents: line.unitPriceCents,
+      inventoryItemId: line.inventoryItemId,
+    })),
+  };
 }
 
 function partyFrom(input: PartyInput, existing?: { id: number }): { id: number; name: string; email: string; phone: string; address: string; notes: string } {
@@ -770,6 +1297,7 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
             subtotalCents: input.amountCents,
             taxCents: tax,
             totalCents: input.amountCents + tax,
+            creditedCents: 0,
             stockDeducted: false,
             lines: [
               {
@@ -786,7 +1314,7 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
           state.invoices.push(invoice);
           state.autoInvoices.push(invoice.id);
         }
-        invoiceId = invoice.id;
+        if (invoice) invoiceId = invoice.id;
       }
 
       if (previous?.invoiceId && state.autoInvoices.includes(previous.invoiceId) && previous.invoiceId !== invoiceId) {
@@ -912,57 +1440,7 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
 
     case "save_invoice": {
       requireOpen();
-      const input = payload.input as InvoiceInput;
-      const lines: InvoiceLine[] = input.lines.map((line, index) => ({
-        id: id("invoice_line"),
-        position: index + 1,
-        description: line.description,
-        qtyHundredths: line.qtyHundredths,
-        unitPriceCents: line.unitPriceCents,
-        amountCents: Math.round((line.qtyHundredths * line.unitPriceCents) / 100),
-        inventoryItemId: line.inventoryItemId ?? null,
-      }));
-      const subtotal = lines.reduce((sum, line) => sum + line.amountCents, 0);
-      const tax = Math.round((subtotal * input.taxBp) / 10_000);
-      const customer = state.customers.find((candidate) => candidate.id === input.customerId);
-      const existing = state.invoices.find((candidate) => candidate.id === input.id);
-      const record: Invoice = {
-        id: input.id ?? id("invoice"),
-        invoiceNo: input.invoiceNo?.trim() || `INV-${1000 + state.invoices.length + 1}`,
-        customerId: input.customerId ?? null,
-        customerName: customer?.name ?? "",
-        invoiceDate: input.invoiceDate,
-        dueDate: input.dueDate ?? null,
-        status: input.status,
-        taxBp: input.taxBp,
-        subtotalCents: subtotal,
-        taxCents: tax,
-        totalCents: subtotal + tax,
-        stockDeducted: input.status !== "Draft",
-        lines,
-      };
-      if (existing) {
-        // Put back what the old version took out, then apply the new version.
-        if (existing.stockDeducted) {
-          for (const line of existing.lines) {
-            if (!line.inventoryItemId) continue;
-            const item = state.items.find((candidate) => candidate.id === line.inventoryItemId);
-            if (item) item.qtyHundredths += line.qtyHundredths;
-          }
-        }
-        Object.assign(existing, record);
-      } else {
-        state.invoices.push(record);
-      }
-      if (record.status !== "Draft") {
-        for (const line of lines) {
-          if (!line.inventoryItemId) continue;
-          const item = state.items.find((candidate) => candidate.id === line.inventoryItemId);
-          if (item) item.qtyHundredths = Math.max(0, item.qtyHundredths - line.qtyHundredths);
-        }
-      }
-      auditRow(existing ? "UPDATE" : "INSERT", "invoices", record.id, record);
-      return record as T;
+      return writeInvoice(payload.input as InvoiceInput) as T;
     }
 
     case "delete_invoice": {
@@ -976,6 +1454,163 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
         }
       }
       state.invoices = state.invoices.filter((candidate) => candidate.id !== payload.id);
+      // The quote or order that pointed here is open again.
+      for (const estimate of state.estimates) {
+        if (estimate.convertedInvoiceId === payload.id) {
+          estimate.convertedInvoiceId = null;
+          estimate.invoiceNo = null;
+          if (!estimate.convertedOrderId) estimate.convertedAt = null;
+        }
+      }
+      for (const order of state.salesOrders) {
+        if (order.invoiceId === payload.id) {
+          order.invoiceId = null;
+          order.invoiceNo = null;
+          order.convertedAt = null;
+          if (order.status === "Fulfilled") order.status = "Confirmed";
+        }
+      }
+      return undefined as T;
+    }
+
+    case "list_credit_memos": {
+      requireOpen();
+      return state.creditMemos
+        .slice()
+        .sort((left, right) => right.memoDate.localeCompare(left.memoDate) || right.id - left.id) as T;
+    }
+
+    case "get_credit_memo": {
+      requireOpen();
+      const memo = state.creditMemos.find((candidate) => candidate.id === payload.id);
+      if (!memo) throw new Error("credit memo does not exist");
+      return memo as T;
+    }
+
+    case "save_credit_memo": {
+      requireOpen();
+      const input = payload.input as CreditMemoInput;
+      const bill = state.invoices.find((candidate) => candidate.id === input.invoiceId);
+      if (!bill) throw new Error("a credit memo must be based on an invoice; that invoice does not exist");
+      if (bill.status === "Draft") {
+        throw new Error(`invoice ${bill.invoiceNo} is still a draft — send it before crediting it, because a draft has not touched the books yet`);
+      }
+      const reason = (input.reason ?? "").trim();
+      if (!reason) throw new Error("choose a reason for the credit");
+      const existing = state.creditMemos.find((candidate) => candidate.id === input.id);
+      if (existing && existing.status !== "Draft") {
+        throw new Error("this credit memo is already posted; void it and issue a new one instead of editing it");
+      }
+
+      const lines: CreditMemoLine[] = [];
+      input.lines.forEach((line, index) => {
+        if (line.qtyHundredths <= 0) return;
+        const original = line.invoiceLineId
+          ? bill.lines.find((candidate) => candidate.id === line.invoiceLineId)
+          : undefined;
+        if (!original && !line.description.trim()) throw new Error("a credit line needs a description");
+        if (original) {
+          const already = state.creditMemos
+            .filter((memo) => memo.status !== "Void" && memo.id !== input.id)
+            .flatMap((memo) => memo.lines)
+            .filter((memoLine) => memoLine.invoiceLineId === original.id)
+            .reduce((sum, memoLine) => sum + memoLine.qtyHundredths, 0);
+          if (line.qtyHundredths + already > original.qtyHundredths) {
+            throw new Error(
+              `invoice ${bill.invoiceNo} only has ${((original.qtyHundredths - already) / 100).toFixed(2)} of "${original.description}" left to credit`,
+            );
+          }
+        }
+        const price = original?.unitPriceCents ?? line.unitPriceCents;
+        lines.push({
+          id: id("credit_line"),
+          position: index + 1,
+          invoiceLineId: original?.id ?? null,
+          description: original?.description ?? line.description,
+          qtyHundredths: line.qtyHundredths,
+          unitPriceCents: price,
+          amountCents: Math.round((line.qtyHundredths * price) / 100),
+          inventoryItemId: original?.inventoryItemId ?? line.inventoryItemId ?? null,
+        });
+      });
+      if (lines.length === 0) throw new Error("choose at least one thing to credit");
+
+      const subtotal = lines.reduce((sum, line) => sum + line.amountCents, 0);
+      const tax = Math.round((subtotal * input.taxBp) / 10_000);
+      const total = subtotal + tax;
+      if (total <= 0) throw new Error("a credit memo must be worth more than zero");
+      const already = creditedOn(bill.id, input.id);
+      if (already + total > bill.totalCents) {
+        throw new Error(
+          `that would credit ${((already + total) / 100).toFixed(2)} against an invoice worth ${(bill.totalCents / 100).toFixed(2)}`,
+        );
+      }
+
+      const status = input.status === "Posted" ? "Posted" : "Draft";
+      const highest = state.creditMemos.reduce((best, memo) => {
+        const digits = Number(memo.memoNo.split("-").pop());
+        return Number.isFinite(digits) ? Math.max(best, digits) : best;
+      }, 1000);
+      const record: CreditMemo = {
+        id: existing?.id ?? id("credit"),
+        memoNo: input.memoNo?.trim() || existing?.memoNo || `CM-${highest + 1}`,
+        invoiceId: bill.id,
+        invoiceNo: bill.invoiceNo,
+        customerId: bill.customerId,
+        customerName: bill.customerName,
+        memoDate: input.memoDate,
+        reason,
+        status,
+        outcome: input.outcome,
+        taxBp: input.taxBp,
+        subtotalCents: subtotal,
+        taxCents: tax,
+        totalCents: total,
+        stockReturned: false,
+        createdAt: existing?.createdAt ?? new Date().toISOString(),
+        postedAt: status === "Posted" ? new Date().toISOString() : null,
+        voidedAt: null,
+        lines,
+      };
+      if (existing) Object.assign(existing, record);
+      else state.creditMemos.push(record);
+      const saved = existing ?? record;
+
+      if (saved.status === "Posted") {
+        restock(saved, 1);
+        saved.stockReturned = saved.lines.some((line) => line.inventoryItemId !== null);
+      }
+      bill.creditedCents = creditedOn(bill.id);
+      auditRow(existing ? "UPDATE" : "INSERT", "credit_memos", saved.id, saved);
+      return saved as T;
+    }
+
+    case "delete_credit_memo": {
+      requireOpen();
+      const memo = state.creditMemos.find((candidate) => candidate.id === payload.id);
+      if (!memo) throw new Error("credit memo does not exist");
+      if (memo.status !== "Draft") {
+        throw new Error("a posted or voided credit memo stays on the books; void it instead of deleting it");
+      }
+      state.creditMemos = state.creditMemos.filter((candidate) => candidate.id !== memo.id);
+      auditRow("DELETE", "credit_memos", memo.id, memo);
+      return undefined as T;
+    }
+
+    case "void_credit_memo": {
+      requireOpen();
+      const memo = state.creditMemos.find((candidate) => candidate.id === payload.id);
+      if (!memo) throw new Error("credit memo does not exist");
+      if (memo.status !== "Posted") {
+        throw new Error("only a posted credit memo can be voided; a draft can simply be deleted");
+      }
+      if (memo.stockReturned) restock(memo, -1);
+      memo.status = "Void";
+      memo.voidedAt = new Date().toISOString();
+      memo.stockReturned = false;
+      const bill = state.invoices.find((candidate) => candidate.id === memo.invoiceId);
+      if (bill) bill.creditedCents = creditedOn(bill.id);
+      auditRow("UPDATE", "credit_memos", memo.id, memo);
       return undefined as T;
     }
 
@@ -1056,6 +1691,7 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
             subtotalCents: schedule.subtotalCents,
             taxCents: tax,
             totalCents: schedule.subtotalCents + tax,
+            creditedCents: 0,
             stockDeducted: false,
             lines: schedule.lines.map((line) => ({ ...line, id: id("invoice_line") })),
           };
@@ -1161,34 +1797,96 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
       requireOpen();
       return state.payroll.slice().sort((left, right) => right.payDate.localeCompare(left.payDate)) as T;
 
+    case "preview_payroll":
     case "save_payroll": {
       requireOpen();
       const input = payload.input as PayrollInput;
-      const overtimeRate = Math.round((input.payRateCents * 3) / 2);
-      const gross = Math.round((input.regularHoursHundredths * input.payRateCents) / 100)
-        + Math.round((input.overtimeHoursHundredths * overtimeRate) / 100);
-      const deductions = (input.federalCents ?? 0) + (input.stateCents ?? 0)
-        + (input.socialSecurityCents ?? 0) + (input.medicareCents ?? 0)
-        + (input.otherDeductionsCents ?? 0);
+      const person = state.employees.find((candidate) => candidate.id === input.employeeId) ?? null;
+      const employee = (input.employee ?? "").trim() || person?.name || "";
+      if (!employee) throw new Error("choose an employee for this pay run");
+      if (input.payMileage && !person) {
+        throw new Error("mileage is reimbursed to an employee record; add this person under Employees first");
+      }
+      const payType: PayType = input.payType === "Salary" ? "Salary" : "Hourly";
+      const payFrequency: PayFrequency = input.payFrequency ?? "BiWeekly";
+      const salaryCents = payType === "Salary" ? Math.max(0, Math.round(input.salaryCents ?? 0)) : 0;
+      let gross: number;
+      if (payType === "Salary") {
+        if (salaryCents <= 0) throw new Error("enter an annual salary for this salaried pay run");
+        if (input.regularHoursHundredths > 0 || input.overtimeHoursHundredths > 0) {
+          throw new Error(
+            "a salary is a fixed amount each period; clear the hours, or record extra pay as an addition",
+          );
+        }
+        gross = Math.round(salaryCents / PAY_PERIODS[payFrequency]);
+      } else {
+        const overtimeRate = Math.round((input.payRateCents * 3) / 2);
+        gross = Math.round((input.regularHoursHundredths * input.payRateCents) / 100)
+          + Math.round((input.overtimeHoursHundredths * overtimeRate) / 100);
+      }
+      if (gross <= 0) throw new Error("enter hours and a pay rate so the pay run is worth something");
+      const marital: MockMarital = input.maritalStatus === "Married" ? "Married" : "Single";
+      const allowances = Math.max(0, Math.round(input.allowances ?? 0));
+      const extra = Math.max(0, Math.round(input.extraWithholdingCents ?? 0));
+      const tax = withholding(gross, marital, allowances, extra);
+      const other = Math.max(0, input.otherDeductionsCents ?? 0);
+      const deductions = tax.federal + tax.state + tax.social + tax.medicare + other;
       if (deductions > gross) throw new Error("deductions cannot exceed gross pay");
+
+      // Additions. Miles are only on the check when the toggle says yes, and a
+      // mile this run already paid still counts while it is being edited.
+      const runId = input.id ?? null;
+      const due = mileageFor(person, runId);
+      const mileageHundredths = input.payMileage ? due.milesHundredths : 0;
+      const mileageCents = input.payMileage ? due.amountCents : 0;
+      const allowanceCents = input.payAllowance ? Math.max(0, Math.round(input.allowanceCents ?? 0)) : 0;
+      const additionsCents = mileageCents + allowanceCents;
+      const net = gross - deductions;
+
       const record: PayrollRun = {
-        id: input.id ?? id("payroll"),
-        employee: input.employee,
+        id: runId ?? id("payroll"),
+        employee,
+        employeeId: input.employeeId ?? null,
         payDate: input.payDate,
         checkNumber: input.checkNumber ?? "",
-        payRateCents: input.payRateCents,
-        regularHoursHundredths: input.regularHoursHundredths,
-        overtimeHoursHundredths: input.overtimeHoursHundredths,
+        payType,
+        payFrequency,
+        periodsPerYear: payType === "Salary" ? PAY_PERIODS[payFrequency] : 0,
+        payRateCents: payType === "Salary" ? 0 : input.payRateCents,
+        salaryCents,
+        regularHoursHundredths: payType === "Salary" ? 0 : input.regularHoursHundredths,
+        overtimeHoursHundredths: payType === "Salary" ? 0 : input.overtimeHoursHundredths,
         grossCents: gross,
-        federalCents: input.federalCents ?? 0,
-        stateCents: input.stateCents ?? 0,
-        socialSecurityCents: input.socialSecurityCents ?? 0,
-        medicareCents: input.medicareCents ?? 0,
-        otherDeductionsCents: input.otherDeductionsCents ?? 0,
+        maritalStatus: marital,
+        allowances,
+        extraWithholdingCents: extra,
+        federalCents: tax.federal,
+        stateCents: tax.state,
+        socialSecurityCents: tax.social,
+        medicareCents: tax.medicare,
+        otherDeductionsCents: other,
         totalDeductionsCents: deductions,
-        netCents: gross - deductions,
-        journalEntryId: id("entry"),
+        mileageHundredths,
+        mileageCents,
+        allowanceCents,
+        additionsCents,
+        netCents: net,
+        paidCents: net + additionsCents,
+        journalEntryId: command === "preview_payroll" ? null : id("entry"),
       };
+      if (command === "preview_payroll") return record as T;
+
+      // Release anything this run claimed before, then claim the miles it pays.
+      for (const entry of state.timeEntries) {
+        if (entry.reimbursedRunId === record.id) entry.reimbursedRunId = null;
+      }
+      if (input.payMileage && person) {
+        for (const entry of state.timeEntries) {
+          if (mileageBelongsTo(entry, person) && entry.reimbursedRunId === null) {
+            entry.reimbursedRunId = record.id;
+          }
+        }
+      }
       const index = state.payroll.findIndex((candidate) => candidate.id === record.id);
       if (index >= 0) state.payroll[index] = record;
       else state.payroll.push(record);
@@ -1198,7 +1896,302 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
     case "delete_payroll":
       requireOpen();
       state.payroll = state.payroll.filter((record) => record.id !== payload.id);
+      for (const entry of state.timeEntries) {
+        if (entry.reimbursedRunId === payload.id) entry.reimbursedRunId = null;
+      }
       return undefined as T;
+
+    case "list_employees":
+      requireOpen();
+      return state.employees
+        .slice()
+        .sort((left, right) => Number(right.isActive) - Number(left.isActive) || left.name.localeCompare(right.name)) as T;
+
+    case "save_employee": {
+      requireOpen();
+      const input = payload.input as EmployeeInput;
+      const name = (input.name ?? "").trim();
+      if (!name) throw new Error("an employee name is required");
+      const digits = (input.ssn ?? "").replace(/\D/g, "");
+      if (digits.length !== 0 && digits.length !== 4 && digits.length !== 9) {
+        throw new Error("enter the Social Security number as nine digits, or just the last four");
+      }
+      const ssn = digits.length === 9 ? digits : "";
+      const ssnLast4 = digits.slice(-4);
+      const payType: PayType = input.payType === "Salary" ? "Salary" : "Hourly";
+      const payFrequency: PayFrequency = input.payFrequency ?? "BiWeekly";
+      const salaryCents = Math.max(0, Math.round(input.salaryCents ?? 0));
+      if (payType === "Salary" && salaryCents <= 0) {
+        throw new Error("a salaried employee needs an annual salary");
+      }
+      const clash = state.employees.find(
+        (candidate) => candidate.name.toLowerCase() === name.toLowerCase() && candidate.id !== input.id,
+      );
+      if (clash) throw new Error(`there is already an employee called ${name}`);
+      const existing = state.employees.find((candidate) => candidate.id === input.id);
+      const record: Employee = {
+        id: existing?.id ?? id("employee"),
+        name,
+        employeeNo: (input.employeeNo ?? existing?.employeeNo ?? "").trim(),
+        email: (input.email ?? existing?.email ?? "").trim(),
+        phone: (input.phone ?? existing?.phone ?? "").trim(),
+        address: (input.address ?? existing?.address ?? "").trim(),
+        ssn,
+        ssnLast4,
+        hireDate: input.hireDate ?? existing?.hireDate ?? null,
+        jobTitle: (input.jobTitle ?? existing?.jobTitle ?? "").trim(),
+        userId: input.userId === undefined ? existing?.userId ?? null : input.userId,
+        filingStatus: input.filingStatus === "Married" ? "Married" : "Single",
+        allowances: Math.max(0, Math.round(input.allowances ?? 0)),
+        extraWithholdingCents: Math.max(0, Math.round(input.extraWithholdingCents ?? 0)),
+        payType,
+        payFrequency,
+        payRateCents: Math.max(0, Math.round(input.payRateCents ?? 0)),
+        salaryCents,
+        allowanceCents: Math.max(0, Math.round(input.allowanceCents ?? 0)),
+        mileageReimbursement: input.mileageReimbursement ?? false,
+        isActive: input.isActive ?? existing?.isActive ?? true,
+        createdAt: existing?.createdAt ?? new Date().toISOString(),
+      };
+      if (existing) Object.assign(existing, record);
+      else state.employees.push(record);
+      auditRow(existing ? "UPDATE" : "INSERT", "employees", record.id, record);
+      return record as T;
+    }
+
+    case "delete_employee": {
+      requireOpen();
+      if (state.payroll.some((run) => run.employeeId === payload.id)) {
+        throw new Error("this employee has pay runs on file, so keep them and mark them inactive instead");
+      }
+      const existing = state.employees.find((candidate) => candidate.id === payload.id);
+      if (!existing) throw new Error("that employee does not exist");
+      state.employees = state.employees.filter((candidate) => candidate.id !== existing.id);
+      auditRow("DELETE", "employees", existing.id, existing);
+      return undefined as T;
+    }
+
+    case "mileage_due": {
+      requireOpen();
+      const person = state.employees.find((candidate) => candidate.id === payload.employeeId) ?? null;
+      return mileageFor(person) as T;
+    }
+
+    case "list_estimates":
+      requireOpen();
+      return state.estimates
+        .slice()
+        .sort((left, right) => right.estimateDate.localeCompare(left.estimateDate) || right.id - left.id) as T;
+
+    case "get_estimate": {
+      requireOpen();
+      const estimate = state.estimates.find((candidate) => candidate.id === payload.id);
+      if (!estimate) throw new Error("estimate does not exist");
+      return estimate as T;
+    }
+
+    case "save_estimate": {
+      requireOpen();
+      const input = payload.input as EstimateInput;
+      const existing = state.estimates.find((candidate) => candidate.id === input.id);
+      if (existing?.convertedAt) {
+        throw new Error(
+          "this estimate has already become an order or an invoice, so its contents are fixed; start a new estimate if the quote changed",
+        );
+      }
+      const lines = writePipelineLines(input.lines.filter((line) => line.description.trim() || line.unitPriceCents > 0));
+      if (lines.length === 0) throw new Error("add at least one line to the document");
+      const totals = pipelineTotals(lines, input.taxBp);
+      if (totals.total <= 0) throw new Error("an estimate must be worth more than zero");
+      const customer = state.customers.find((candidate) => candidate.id === input.customerId);
+      const record: Estimate = {
+        id: input.id ?? id("estimate"),
+        estimateNo:
+          input.estimateNo?.trim() ||
+          nextSeries("EST", state.estimates.map((candidate) => candidate.estimateNo)),
+        customerId: input.customerId ?? null,
+        customerName: customer?.name ?? "",
+        estimateDate: input.estimateDate,
+        expiryDate: input.expiryDate ?? null,
+        status: input.status,
+        taxBp: input.taxBp,
+        notes: input.notes ?? "",
+        subtotalCents: totals.subtotal,
+        taxCents: totals.tax,
+        totalCents: totals.total,
+        convertedOrderId: existing?.convertedOrderId ?? null,
+        convertedInvoiceId: existing?.convertedInvoiceId ?? null,
+        convertedAt: existing?.convertedAt ?? null,
+        orderNo: existing?.orderNo ?? null,
+        invoiceNo: existing?.invoiceNo ?? null,
+        lines,
+      };
+      if (existing) Object.assign(existing, record);
+      else state.estimates.push(record);
+      auditRow(existing ? "UPDATE" : "INSERT", "estimates", record.id, record);
+      return record as T;
+    }
+
+    case "delete_estimate": {
+      requireOpen();
+      const estimate = state.estimates.find((candidate) => candidate.id === payload.id);
+      if (!estimate) throw new Error("estimate does not exist");
+      if (estimate.convertedAt) {
+        throw new Error("this estimate already became an order or an invoice, so it stays on file");
+      }
+      state.estimates = state.estimates.filter((candidate) => candidate.id !== estimate.id);
+      auditRow("DELETE", "estimates", estimate.id, estimate);
+      return undefined as T;
+    }
+
+    case "convert_estimate_to_order": {
+      requireOpen();
+      const estimate = state.estimates.find((candidate) => candidate.id === payload.id);
+      if (!estimate) throw new Error("estimate does not exist");
+      if (estimate.convertedAt) {
+        throw new Error(`${estimate.estimateNo} has already become ${estimate.invoiceNo ?? estimate.orderNo ?? "another document"}`);
+      }
+      if (estimate.status === "Declined" || estimate.status === "Expired") {
+        throw new Error(`${estimate.estimateNo} is ${estimate.status}, so it cannot become an order`);
+      }
+      const date = (payload.orderDate as string) || today();
+      const totals = pipelineTotals(estimate.lines, estimate.taxBp);
+      const order: SalesOrder = {
+        id: id("order"),
+        orderNo: nextSeries("SO", state.salesOrders.map((candidate) => candidate.orderNo)),
+        customerId: estimate.customerId,
+        customerName: estimate.customerName,
+        orderDate: date,
+        requestedDate: estimate.expiryDate,
+        status: "Confirmed",
+        taxBp: estimate.taxBp,
+        notes: estimate.notes,
+        subtotalCents: totals.subtotal,
+        taxCents: totals.tax,
+        totalCents: totals.total,
+        invoiceId: null,
+        invoiceNo: null,
+        estimateId: estimate.id,
+        estimateNo: estimate.estimateNo,
+        convertedAt: null,
+        lines: estimate.lines.map((line, index) => ({ ...line, id: id("order_line"), position: index + 1 })),
+      };
+      state.salesOrders.push(order);
+      estimate.convertedOrderId = order.id;
+      estimate.convertedAt = new Date().toISOString();
+      estimate.status = "Accepted";
+      estimate.orderNo = order.orderNo;
+      auditRow("UPDATE", "estimates", estimate.id, estimate);
+      return order as T;
+    }
+
+    case "convert_estimate_to_invoice": {
+      requireOpen();
+      const estimate = state.estimates.find((candidate) => candidate.id === payload.id);
+      if (!estimate) throw new Error("estimate does not exist");
+      if (estimate.convertedInvoiceId) throw new Error(`${estimate.estimateNo} has already been invoiced`);
+      if (estimate.status === "Declined" || estimate.status === "Expired") {
+        throw new Error(`${estimate.estimateNo} is ${estimate.status}, so it cannot be invoiced`);
+      }
+      const date = (payload.invoiceDate as string) || today();
+      const invoice = writeInvoice(
+        invoiceInputFrom(estimate.customerId, date, estimate.taxBp, estimate.lines),
+      );
+      estimate.convertedInvoiceId = invoice.id;
+      estimate.convertedAt = new Date().toISOString();
+      estimate.status = "Accepted";
+      estimate.invoiceNo = invoice.invoiceNo;
+      return invoice as T;
+    }
+
+    case "list_sales_orders":
+      requireOpen();
+      return state.salesOrders
+        .slice()
+        .sort((left, right) => right.orderDate.localeCompare(left.orderDate) || right.id - left.id) as T;
+
+    case "get_sales_order": {
+      requireOpen();
+      const order = state.salesOrders.find((candidate) => candidate.id === payload.id);
+      if (!order) throw new Error("sales order does not exist");
+      return order as T;
+    }
+
+    case "save_sales_order": {
+      requireOpen();
+      const input = payload.input as SalesOrderInput;
+      const existing = state.salesOrders.find((candidate) => candidate.id === input.id);
+      if (existing?.invoiceId) {
+        throw new Error(
+          "this order has already been invoiced, so its contents are fixed; start a new order if it changed",
+        );
+      }
+      const lines = writePipelineLines(input.lines.filter((line) => line.description.trim() || line.unitPriceCents > 0));
+      if (lines.length === 0) throw new Error("add at least one line to the document");
+      const totals = pipelineTotals(lines, input.taxBp);
+      if (totals.total <= 0) throw new Error("a sales order must be worth more than zero");
+      const customer = state.customers.find((candidate) => candidate.id === input.customerId);
+      const record: SalesOrder = {
+        id: input.id ?? id("order"),
+        orderNo:
+          input.orderNo?.trim() ||
+          nextSeries("SO", state.salesOrders.map((candidate) => candidate.orderNo)),
+        customerId: input.customerId ?? null,
+        customerName: customer?.name ?? "",
+        orderDate: input.orderDate,
+        requestedDate: input.requestedDate ?? null,
+        status: input.status,
+        taxBp: input.taxBp,
+        notes: input.notes ?? "",
+        subtotalCents: totals.subtotal,
+        taxCents: totals.tax,
+        totalCents: totals.total,
+        invoiceId: existing?.invoiceId ?? null,
+        invoiceNo: existing?.invoiceNo ?? null,
+        estimateId: existing?.estimateId ?? null,
+        estimateNo: existing?.estimateNo ?? null,
+        convertedAt: existing?.convertedAt ?? null,
+        lines,
+      };
+      if (existing) Object.assign(existing, record);
+      else state.salesOrders.push(record);
+      auditRow(existing ? "UPDATE" : "INSERT", "sales_orders", record.id, record);
+      return record as T;
+    }
+
+    case "delete_sales_order": {
+      requireOpen();
+      const order = state.salesOrders.find((candidate) => candidate.id === payload.id);
+      if (!order) throw new Error("sales order does not exist");
+      if (order.invoiceId) throw new Error("this order has already been invoiced, so it stays on file");
+      state.salesOrders = state.salesOrders.filter((candidate) => candidate.id !== order.id);
+      for (const estimate of state.estimates) {
+        if (estimate.convertedOrderId === order.id) {
+          estimate.convertedOrderId = null;
+          estimate.orderNo = null;
+        }
+      }
+      auditRow("DELETE", "sales_orders", order.id, order);
+      return undefined as T;
+    }
+
+    case "convert_sales_order_to_invoice": {
+      requireOpen();
+      const order = state.salesOrders.find((candidate) => candidate.id === payload.id);
+      if (!order) throw new Error("sales order does not exist");
+      if (order.invoiceId) throw new Error(`${order.orderNo} has already been invoiced`);
+      if (order.status === "Cancelled") throw new Error(`${order.orderNo} is cancelled, so it cannot be invoiced`);
+      const date = (payload.invoiceDate as string) || today();
+      const invoice = writeInvoice(invoiceInputFrom(order.customerId, date, order.taxBp, order.lines));
+      order.invoiceId = invoice.id;
+      order.invoiceNo = invoice.invoiceNo;
+      order.convertedAt = new Date().toISOString();
+      order.status = "Fulfilled";
+      for (const estimate of state.estimates) {
+        if (estimate.convertedOrderId === order.id) estimate.convertedInvoiceId = invoice.id;
+      }
+      return invoice as T;
+    }
 
     case "dashboard": {
       requireOpen();
@@ -1261,6 +2254,144 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
         purchaseTaxCents: state.expenses.reduce((sum, record) => sum + record.taxCents, 0),
       };
       return summary as T;
+    }
+
+    case "current_user":
+      return actingUser() as T;
+
+    case "switch_user": {
+      const user = state.users.find((candidate) => candidate.id === payload.id);
+      if (!user) throw new Error("that user does not exist");
+      if (!user.isActive) throw new Error(`${user.name} is switched off; switch them back on first`);
+      state.currentUserId = user.id;
+      return user as T;
+    }
+
+    case "list_people": {
+      requireOpen();
+      return state.users.map((user) => ({
+        id: user.id,
+        name: user.name,
+        access: user.access,
+        isActive: user.isActive,
+      })) as T;
+    }
+
+    case "list_users": {
+      requireOpen();
+      return state.users.slice().sort((left, right) => left.name.localeCompare(right.name)) as T;
+    }
+
+    case "save_user": {
+      requireOpen();
+      const input = payload.input as UserInput;
+      const name = (input.name ?? "").trim();
+      if (!name) throw new Error("a user needs a name");
+      if (state.users.some((candidate) => candidate.name.toLowerCase() === name.toLowerCase() && candidate.id !== input.id)) {
+        throw new Error(`there is already a user called ${name}`);
+      }
+      const existing = state.users.find((candidate) => candidate.id === input.id);
+      const access = input.access ?? "Standard";
+      const isActive = input.isActive ?? true;
+      if (existing && existing.access === "Admin" && existing.isActive && (access !== "Admin" || !isActive)) {
+        const otherAdmins = state.users.filter(
+          (candidate) => candidate.id !== existing.id && candidate.access === "Admin" && candidate.isActive,
+        ).length;
+        if (otherAdmins === 0) throw new Error("this is the last admin; promote someone else before changing this user");
+      }
+      const record: User = {
+        id: existing?.id ?? id("user"),
+        name,
+        email: (input.email ?? "").trim(),
+        access,
+        isActive,
+        createdAt: existing?.createdAt ?? new Date().toISOString(),
+      };
+      if (existing) Object.assign(existing, record);
+      else state.users.push(record);
+      auditRow(existing ? "UPDATE" : "INSERT", "users", record.id, record);
+      return record as T;
+    }
+
+    case "delete_user": {
+      requireOpen();
+      const user = state.users.find((candidate) => candidate.id === payload.id);
+      if (!user) throw new Error("that user does not exist");
+      if (user.access === "Admin" && user.isActive) {
+        const otherAdmins = state.users.filter(
+          (candidate) => candidate.id !== user.id && candidate.access === "Admin" && candidate.isActive,
+        ).length;
+        if (otherAdmins === 0) throw new Error("this is the last admin; promote someone else before deleting this user");
+      }
+      state.users = state.users.filter((candidate) => candidate.id !== user.id);
+      state.timeEntries = state.timeEntries.filter((entry) => entry.userId !== user.id);
+      if (state.currentUserId === user.id) state.currentUserId = actingUser().id;
+      auditRow("DELETE", "users", user.id, user);
+      return undefined as T;
+    }
+
+    case "list_time_entries": {
+      requireOpen();
+      const me = actingUser();
+      const entries = me.access === "TimeEntry" ? state.timeEntries.filter((entry) => entry.userId === me.id) : state.timeEntries;
+      return entries
+        .slice()
+        .sort((left, right) => right.entryDate.localeCompare(left.entryDate) || right.id - left.id) as T;
+    }
+
+    case "save_time_entry": {
+      requireOpen();
+      const input = payload.input as TimeEntryInput;
+      const me = actingUser();
+      if (!input.entryDate) throw new Error("the date is required");
+      if (input.quantityHundredths <= 0) {
+        throw new Error(input.kind === "Mileage" ? "enter the miles driven" : "enter the hours worked");
+      }
+      const ownerId = me.access === "TimeEntry" ? me.id : input.userId ?? me.id;
+      const owner = state.users.find((candidate) => candidate.id === ownerId);
+      if (!owner) throw new Error("that person is not on this company file");
+      const existing = state.timeEntries.find((candidate) => candidate.id === input.id);
+      if (existing && me.access === "TimeEntry" && existing.userId !== me.id) {
+        throw new Error("that time entry belongs to someone else");
+      }
+      if (existing?.reimbursedRunId) {
+        throw new Error("this mileage was already reimbursed on a pay run; it stays as it was paid");
+      }
+      const record: TimeEntry = {
+        id: existing?.id ?? id("time"),
+        userId: owner.id,
+        enteredBy: owner.name,
+        entryDate: input.entryDate,
+        kind: input.kind,
+        description: (input.description ?? "").trim(),
+        customer: (input.customer ?? "").trim(),
+        quantityHundredths: input.quantityHundredths,
+        rateCents: input.rateCents,
+        amountCents: Math.round((input.quantityHundredths * input.rateCents) / 100),
+        isBillable: input.isBillable ?? true,
+        reimbursedRunId: existing?.reimbursedRunId ?? null,
+        createdAt: existing?.createdAt ?? new Date().toISOString(),
+      };
+      if (existing) Object.assign(existing, record);
+      else state.timeEntries.push(record);
+      auditRow(existing ? "UPDATE" : "INSERT", "time_entries", record.id, record);
+      return record as T;
+    }
+
+    case "delete_time_entry": {
+      requireOpen();
+      const me = actingUser();
+      const entry = state.timeEntries.find((candidate) => candidate.id === payload.id);
+      if (!entry) throw new Error("that time entry does not exist");
+      if (me.access === "TimeEntry" && entry.userId !== me.id) {
+        throw new Error("that time entry belongs to someone else");
+      }
+      if (entry.reimbursedRunId) {
+        throw new Error("this mileage was reimbursed on a pay run; delete that pay run first");
+      }
+      state.timeEntries = state.timeEntries.filter((candidate) => candidate.id !== entry.id);
+      auditRow("DELETE", "time_entries", entry.id, entry);
+      return undefined as T;
     }
 
     case "list_settings":
@@ -1392,7 +2523,7 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
 
     case "ledger_health": {
       const health: LedgerHealth = {
-        schemaVersion: 2,
+        schemaVersion: 7,
         integrity: "ok",
         balanced: true,
         accountCount: state.accounts.length,

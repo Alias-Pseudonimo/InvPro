@@ -1,8 +1,19 @@
-import { useState, type ReactNode } from "react";
+import { useState } from "react";
 import { api, isDesktop } from "../api";
+import {
+  DocumentTotals,
+  LineEditor,
+  blankLine,
+  lineAmount,
+  linesFrom,
+  payloadLines,
+  type DraftLine,
+} from "../components/DocumentLines";
 import { useBusinessProfile } from "../business";
 import { invoiceDocument, printDocument, saveDocument } from "../documents";
+import { CreditMemoComposer } from "./Credits";
 import type {
+  CreditMemo,
   Customer,
   InventoryItem,
   Invoice,
@@ -20,116 +31,8 @@ interface Props {
   changed: (message?: string) => void;
 }
 
-interface DraftLine {
-  key: number;
-  description: string;
-  qty: string;
-  price: string;
-  itemId: string;
-}
-
-let lineKey = 0;
-function blankLine(price = ""): DraftLine {
-  lineKey += 1;
-  return { key: lineKey, description: "", qty: "1", price, itemId: "" };
-}
-
-function lineAmount(line: DraftLine): number {
-  const qty = Number(line.qty) || 0;
-  const price = Number(line.price) || 0;
-  return Math.round(qty * price * 100);
-}
-
 function statusTone(status: InvoiceStatus): "paid" | "unpaid" | "draft" {
   return status === "Paid" ? "paid" : status === "Draft" ? "draft" : "unpaid";
-}
-
-/* ------------------------------------------------------------------ */
-/* Invoices                                                           */
-/* ------------------------------------------------------------------ */
-
-/** The line grid an invoice and a recurring schedule both use. */
-function LineEditor({
-  lines,
-  setLines,
-  items,
-  totals,
-}: {
-  lines: DraftLine[];
-  setLines: React.Dispatch<React.SetStateAction<DraftLine[]>>;
-  items: InventoryItem[];
-  totals?: ReactNode;
-}) {
-  function updateLine(key: number, patch: Partial<DraftLine>) {
-    setLines((current) => current.map((line) => (line.key === key ? { ...line, ...patch } : line)));
-  }
-
-  function pickItem(key: number, itemId: string) {
-    const item = items.find((candidate) => String(candidate.id) === itemId);
-    setLines((current) =>
-      current.map((line) =>
-        line.key === key
-          ? {
-              ...line,
-              itemId,
-              description: item && !line.description ? item.name : line.description,
-              price: item && item.salePriceCents > 0 ? centsInput(item.salePriceCents) : line.price,
-            }
-          : line,
-      ),
-    );
-  }
-
-  return (
-    <>
-      <div className="line-grid line-head">
-        <span>Description</span>
-        <span>Stock item</span>
-        <span>Qty</span>
-        <span>Price</span>
-        <span />
-      </div>
-      {lines.map((line) => (
-        <div className="line-grid" key={line.key}>
-          <input
-            placeholder="What are you billing for?"
-            value={line.description}
-            onChange={(event) => updateLine(line.key, { description: event.target.value })}
-          />
-          <select value={line.itemId} onChange={(event) => pickItem(line.key, event.target.value)}>
-            <option value="">— none —</option>
-            {items
-              .filter((item) => item.kind !== "Consumable")
-              .map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.name}
-                </option>
-              ))}
-          </select>
-          <input value={line.qty} onChange={(event) => updateLine(line.key, { qty: event.target.value })} />
-          <input value={line.price} onChange={(event) => updateLine(line.key, { price: event.target.value })} />
-          <button
-            type="button"
-            className="icon-btn"
-            onClick={() =>
-              setLines((current) =>
-                current.length === 1 ? [blankLine()] : current.filter((row) => row.key !== line.key),
-              )
-            }
-            aria-label="Remove line"
-          >
-            ✕
-          </button>
-        </div>
-      ))}
-      <div className="line-foot">
-        <button type="button" className="btn btn-sm" onClick={() => setLines((current) => [...current, blankLine()])}>
-          + Add line
-        </button>
-        {totals}
-      </div>
-    </>
-  );
 }
 
 export function InvoicesScreen({ revision, changed }: Props) {
@@ -140,9 +43,11 @@ export function InvoicesScreen({ revision, changed }: Props) {
   const profile = useBusinessProfile(revision);
 
   const schedules = useLoad<RecurringInvoice[]>(() => api.listRecurringInvoices(), [revision]).data ?? [];
+  const memos = useLoad<CreditMemo[]>(() => api.listCreditMemos(), [revision]).data ?? [];
 
   const [editing, setEditing] = useState<Invoice | "new" | null>(null);
   const [viewing, setViewing] = useState<Invoice | null>(null);
+  const [crediting, setCrediting] = useState<Invoice | null>(null);
   const [lines, setLines] = useState<DraftLine[]>([blankLine()]);
   const [taxPct, setTaxPct] = useState("0");
   const [formError, setFormError] = useState<string | null>(null);
@@ -159,15 +64,7 @@ export function InvoicesScreen({ revision, changed }: Props) {
       setLines([blankLine()]);
       setTaxPct("0");
     } else {
-      setLines(
-        record.lines.map((line) => ({
-          key: ++lineKey,
-          description: line.description,
-          qty: qtyInput(line.qtyHundredths),
-          price: centsInput(line.unitPriceCents),
-          itemId: line.inventoryItemId ? String(line.inventoryItemId) : "",
-        })),
-      );
+      setLines(linesFrom(record.lines));
       setTaxPct((record.taxBp / 100).toFixed(2));
     }
   }
@@ -184,15 +81,7 @@ export function InvoicesScreen({ revision, changed }: Props) {
       setScheduleLines([blankLine()]);
       setScheduleTax("0");
     } else {
-      setScheduleLines(
-        record.lines.map((line) => ({
-          key: ++lineKey,
-          description: line.description,
-          qty: qtyInput(line.qtyHundredths),
-          price: centsInput(line.unitPriceCents),
-          itemId: line.inventoryItemId ? String(line.inventoryItemId) : "",
-        })),
-      );
+      setScheduleLines(linesFrom(record.lines));
       setScheduleTax((record.taxBp / 100).toFixed(2));
     }
   }
@@ -328,7 +217,12 @@ export function InvoicesScreen({ revision, changed }: Props) {
                   <td>
                     <Pill tone={statusTone(invoice.status)}>{invoice.status}</Pill>
                   </td>
-                  <td className="num">{money(invoice.totalCents)}</td>
+                  <td className="num">
+                    {money(invoice.totalCents)}
+                    {invoice.creditedCents > 0 && (
+                      <div className="muted small">−{money(invoice.creditedCents)} credited</div>
+                    )}
+                  </td>
                   <td>
                     <div className="row-actions">
                       {invoice.status === "Draft" && (
@@ -344,6 +238,11 @@ export function InvoicesScreen({ revision, changed }: Props) {
                       <button type="button" className="btn btn-sm btn-ghost" onClick={() => open(invoice)}>
                         Edit
                       </button>
+                      {invoice.status !== "Draft" && invoice.creditedCents < invoice.totalCents && (
+                        <button type="button" className="btn btn-sm btn-ghost" onClick={() => setCrediting(invoice)}>
+                          Credit
+                        </button>
+                      )}
                       <button type="button" className="btn btn-sm btn-ghost" onClick={() => setViewing(invoice)}>
                         Print
                       </button>
@@ -441,14 +340,7 @@ export function InvoicesScreen({ revision, changed }: Props) {
                   dueDate: field(form, "dueDate") || null,
                   status: field(form, "status") as InvoiceStatus,
                   taxBp: Math.round(Number(taxPct || "0") * 100),
-                  lines: lines
-                    .filter((line) => line.description.trim() || Number(line.price) > 0)
-                    .map((line) => ({
-                      description: line.description,
-                      qtyHundredths: toHundredths(line.qty),
-                      unitPriceCents: toCents(line.price),
-                      inventoryItemId: Number(line.itemId) || null,
-                    })),
+                  lines: payloadLines(lines),
                 });
                 changed("Invoice saved");
               },
@@ -500,23 +392,13 @@ export function InvoicesScreen({ revision, changed }: Props) {
                 setLines={setLines}
                 items={items}
                 totals={
-                  <div className="totals">
-                    <div className="kv">
-                      <span>Subtotal</span>
-                      <strong className="num">{money(subtotal)}</strong>
-                    </div>
-                    <div className="kv">
-                      <span>
-                        Tax %
-                        <input className="tiny-input" value={taxPct} onChange={(event) => setTaxPct(event.target.value)} />
-                      </span>
-                      <strong className="num">{money(tax)}</strong>
-                    </div>
-                    <div className="kv total">
-                      <span>Total</span>
-                      <strong className="num">{money(subtotal + tax)}</strong>
-                    </div>
-                  </div>
+                  <DocumentTotals
+                    subtotal={subtotal}
+                    taxPct={taxPct}
+                    setTaxPct={setTaxPct}
+                    tax={tax}
+                    total={subtotal + tax}
+                  />
                 }
               />
               <div className="settings-note">
@@ -557,6 +439,14 @@ export function InvoicesScreen({ revision, changed }: Props) {
           </div>
         </Modal>
       )}
+      {crediting && (
+        <CreditMemoComposer
+          invoice={crediting}
+          memos={memos.filter((memo) => memo.invoiceId === crediting.id)}
+          onClose={() => setCrediting(null)}
+          onSaved={(message) => changed(message)}
+        />
+      )}
       {schedule && (
         <Modal
           title={schedule === "new" ? "New recurring invoice" : "Edit recurring invoice"}
@@ -575,14 +465,7 @@ export function InvoicesScreen({ revision, changed }: Props) {
                   endDate: field(form, "endDate") || null,
                   taxBp: Math.round(Number(scheduleTax || "0") * 100),
                   isActive: field(form, "state") !== "Paused",
-                  lines: scheduleLines
-                    .filter((line) => line.description.trim() || Number(line.price) > 0)
-                    .map((line) => ({
-                      description: line.description,
-                      qtyHundredths: toHundredths(line.qty),
-                      unitPriceCents: toCents(line.price),
-                      inventoryItemId: Number(line.itemId) || null,
-                    })),
+                  lines: payloadLines(scheduleLines),
                 });
                 changed("Schedule saved");
               },
@@ -648,27 +531,13 @@ export function InvoicesScreen({ revision, changed }: Props) {
                 setLines={setScheduleLines}
                 items={items}
                 totals={
-                  <div className="totals">
-                    <div className="kv">
-                      <span>Subtotal</span>
-                      <strong className="num">{money(scheduleSubtotal)}</strong>
-                    </div>
-                    <div className="kv">
-                      <span>
-                        Tax %
-                        <input
-                          className="tiny-input"
-                          value={scheduleTax}
-                          onChange={(event) => setScheduleTax(event.target.value)}
-                        />
-                      </span>
-                      <strong className="num">{money(scheduleTaxCents)}</strong>
-                    </div>
-                    <div className="kv total">
-                      <span>Total</span>
-                      <strong className="num">{money(scheduleSubtotal + scheduleTaxCents)}</strong>
-                    </div>
-                  </div>
+                  <DocumentTotals
+                    subtotal={scheduleSubtotal}
+                    taxPct={scheduleTax}
+                    setTaxPct={setScheduleTax}
+                    tax={scheduleTaxCents}
+                    total={scheduleSubtotal + scheduleTaxCents}
+                  />
                 }
               />
               <div className="settings-note">
@@ -712,10 +581,9 @@ export function PurchasesScreen({ revision, changed }: Props) {
     } else {
       setLines(
         record.lines.map((line) => ({
-          key: ++lineKey,
+          ...blankLine(centsInput(line.unitCostCents)),
           description: line.description,
           qty: qtyInput(line.qtyHundredths),
-          price: centsInput(line.unitCostCents),
           itemId: line.inventoryItemId ? String(line.inventoryItemId) : "",
         })),
       );

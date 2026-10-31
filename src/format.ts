@@ -16,6 +16,29 @@ export function parseAmount(input: string): number | null {
   return Math.round(value * 100);
 }
 
+import type { PayFrequency } from "./types";
+
+/** Checks a year. Two weeks is 26, not 24 — the difference is a whole check. */
+export const PAY_PERIODS: Record<PayFrequency, number> = {
+  Weekly: 52,
+  BiWeekly: 26,
+  SemiMonthly: 24,
+  Monthly: 12,
+};
+
+export function payFrequencyLabel(frequency: PayFrequency): string {
+  if (frequency === "Weekly") return "Every week";
+  if (frequency === "SemiMonthly") return "Twice a month";
+  if (frequency === "Monthly") return "Once a month";
+  return "Every two weeks";
+}
+
+/** What one period of a salary comes to, half-up on the last cent. */
+export function salaryPerPeriod(salaryCents: number, frequency: PayFrequency): number {
+  const periods = PAY_PERIODS[frequency];
+  return Math.round(salaryCents / periods);
+}
+
 export function today(): string {
   const now = new Date();
   const month = String(now.getMonth() + 1).padStart(2, "0");
