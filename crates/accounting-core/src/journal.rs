@@ -290,8 +290,37 @@ pub fn post_draft(conn: &mut Connection, entry_id: i64) -> Result<()> {
 /// Nothing is sealed here: the caller seals the audit rows and commits, so a
 /// friendly record (an invoice, a pay run) and the entry it produces land in the
 /// file together or not at all.
+/// The date the books are closed through, if any. An admin sets this in
+/// Settings; the engine refuses to write anything dated on or before it, so a
+/// closed period stays closed no matter which screen is driving the write.
+pub fn locked_through(conn: &Connection) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = 'books_locked_through'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    // A company file older than the settings table simply has no lock.
+    .ok()
+    .flatten()
+    .map(|value| value.trim().to_string())
+    .filter(|value| is_valid_date(value))
+}
+
+fn reject_closed_period(conn: &Connection, entry_date: &str) -> Result<()> {
+    if let Some(lock) = locked_through(conn) {
+        if entry_date <= lock.as_str() {
+            return Err(CoreError::validation(format!(
+                "the books are closed through {lock}; date this entry after that, or reopen the period in Settings"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn post_in(conn: &Connection, input: &JournalEntryInput) -> Result<EntryDetail> {
     validate(conn, input)?;
+    reject_closed_period(conn, &input.entry_date)?;
     let entry_no: i64 = conn.query_row(
         "SELECT COALESCE(MAX(entry_no), 0) + 1 FROM journal_entries",
         [],
@@ -355,14 +384,14 @@ pub fn void_entry(conn: &mut Connection, entry_id: i64) -> Result<()> {
 
 /// Void an entry inside a transaction the caller already owns.
 pub fn void_in(conn: &Connection, entry_id: i64) -> Result<()> {
-    let status: Option<String> = conn
+    let status: Option<(String, String)> = conn
         .query_row(
-            "SELECT status FROM journal_entries WHERE id = ?1",
+            "SELECT status, entry_date FROM journal_entries WHERE id = ?1",
             [entry_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    match status.as_deref() {
+    match status.as_ref().map(|(status, _)| status.as_str()) {
         None => return Err(CoreError::not_found(format!("entry {entry_id} does not exist"))),
         Some("VOID") => return Err(CoreError::validation("this entry is already void")),
         Some("DRAFT") => {
@@ -370,6 +399,10 @@ pub fn void_in(conn: &Connection, entry_id: i64) -> Result<()> {
             return Ok(());
         }
         Some(_) => {}
+    }
+
+    if let Some((_, entry_date)) = status.as_ref() {
+        reject_closed_period(conn, entry_date)?;
     }
 
     conn.execute("UPDATE journal_entries SET status = 'VOID' WHERE id = ?1", [entry_id])?;

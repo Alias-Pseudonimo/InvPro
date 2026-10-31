@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::accounts::{self, AccountInput, AccountType};
 use crate::journal::{self, EntrySource, JournalEntryInput, JournalLineInput};
-use crate::{audit, dates, money, CoreError, Result};
+use crate::{audit, dates, employees, money, CoreError, Result};
 
 // ---------------------------------------------------------------------------
 // Account roles. Stored in `settings` as account ids.
@@ -35,12 +35,14 @@ const ROLE_INVENTORY: &str = "inventory_account";
 const ROLE_COGS: &str = "cogs_account";
 const ROLE_PAYROLL_EXPENSE: &str = "payroll_expense_account";
 const ROLE_PAYROLL_LIABILITY: &str = "payroll_liability_account";
+const ROLE_PAYROLL_ADDITIONS: &str = "payroll_additions_account";
+const ROLE_CUSTOMER_CREDIT: &str = "customer_credit_account";
 
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
 
-fn required_text(value: &str, what: &str) -> Result<String> {
+pub(crate) fn required_text(value: &str, what: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(CoreError::validation(format!("{what} is required")));
@@ -48,7 +50,7 @@ fn required_text(value: &str, what: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
-fn checked_date(value: &str, what: &str) -> Result<String> {
+pub(crate) fn checked_date(value: &str, what: &str) -> Result<String> {
     if !journal::is_valid_date(value) {
         return Err(CoreError::validation(format!(
             "{what} must be a real date in YYYY-MM-DD form"
@@ -57,7 +59,7 @@ fn checked_date(value: &str, what: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
-fn checked_tax_rate(tax_bp: i64) -> Result<i64> {
+pub(crate) fn checked_tax_rate(tax_bp: i64) -> Result<i64> {
     if !(0..=10_000).contains(&tax_bp) {
         return Err(CoreError::validation(
             "a tax rate must be between 0 and 100 percent",
@@ -282,8 +284,22 @@ fn cogs_account(conn: &mut Connection) -> Result<i64> {
     )
 }
 
+/// A credit a customer is holding but has not spent yet. It is a liability
+/// until it is applied to an invoice, which is why it is not left sitting in
+/// receivables.
+pub(crate) fn customer_credit_account(conn: &mut Connection) -> Result<i64> {
+    role_account(
+        conn,
+        ROLE_CUSTOMER_CREDIT,
+        "2400",
+        "Customer Credits",
+        AccountType::Liability,
+        "Other Current Liability",
+    )
+}
+
 /// Find (or create) the account behind a category the owner typed.
-fn category_account(
+pub(crate) fn category_account(
     conn: &mut Connection,
     category: &str,
     account_type: AccountType,
@@ -358,16 +374,16 @@ fn category_account(
 /// writes the invoice. Finding or creating an account can itself need a write,
 /// and only one transaction can own the connection at a time.
 #[derive(Clone, Copy)]
-struct InvoiceAccounts {
-    cash: i64,
-    receivable: i64,
-    tax: i64,
-    inventory: i64,
-    cogs: i64,
-    income: i64,
+pub(crate) struct InvoiceAccounts {
+    pub(crate) cash: i64,
+    pub(crate) receivable: i64,
+    pub(crate) tax: i64,
+    pub(crate) inventory: i64,
+    pub(crate) cogs: i64,
+    pub(crate) income: i64,
 }
 
-fn invoice_accounts(conn: &mut Connection) -> Result<InvoiceAccounts> {
+pub(crate) fn invoice_accounts(conn: &mut Connection) -> Result<InvoiceAccounts> {
     let income_name = setting(conn, "invoice_income_account")?
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "Sales Revenue".to_string());
@@ -386,7 +402,7 @@ fn invoice_accounts(conn: &mut Connection) -> Result<InvoiceAccounts> {
 // Posting helper
 // ---------------------------------------------------------------------------
 
-fn line(account_id: i64, debit_cents: i64, credit_cents: i64) -> JournalLineInput {
+pub(crate) fn line(account_id: i64, debit_cents: i64, credit_cents: i64) -> JournalLineInput {
     JournalLineInput {
         account_id,
         debit_cents,
@@ -826,7 +842,7 @@ fn stock_in_reverse(conn: &Connection, item_id: i64, qty: i64, cost_cents: i64) 
     Ok(())
 }
 
-fn adjust_stock(conn: &Connection, item_id: i64, delta: i64) -> Result<()> {
+pub(crate) fn adjust_stock(conn: &Connection, item_id: i64, delta: i64) -> Result<()> {
     conn.execute(
         "UPDATE inventory_items
             SET qty_hundredths = MAX(0, qty_hundredths + ?2)
@@ -836,7 +852,7 @@ fn adjust_stock(conn: &Connection, item_id: i64, delta: i64) -> Result<()> {
     Ok(())
 }
 
-fn item_cost(conn: &Connection, item_id: i64) -> Result<i64> {
+pub(crate) fn item_cost(conn: &Connection, item_id: i64) -> Result<i64> {
     Ok(conn
         .query_row(
             "SELECT unit_cost_cents FROM inventory_items WHERE id = ?1",
@@ -1550,6 +1566,8 @@ pub struct Invoice {
     pub subtotal_cents: i64,
     pub tax_cents: i64,
     pub total_cents: i64,
+    /// Everything already credited against this invoice by posted credit memos.
+    pub credited_cents: i64,
     pub stock_deducted: bool,
     pub lines: Vec<InvoiceLine>,
 }
@@ -1614,7 +1632,9 @@ fn invoice_by_id(conn: &Connection, id: i64) -> Result<Invoice> {
             "SELECT i.id, i.invoice_no, i.customer_id, COALESCE(c.name, ''), i.invoice_date,
                     i.due_date, i.status, i.tax_bp, i.stock_deducted,
                     COALESCE((SELECT SUM((l.qty_hundredths * l.unit_price_cents + 50) / 100)
-                                FROM invoice_lines l WHERE l.invoice_id = i.id), 0)
+                                FROM invoice_lines l WHERE l.invoice_id = i.id), 0),
+                    COALESCE((SELECT SUM(m.total_cents) FROM credit_memos m
+                               WHERE m.invoice_id = i.id AND m.status = 'Posted'), 0)
                FROM invoices i
                LEFT JOIN customers c ON c.id = i.customer_id
               WHERE i.id = ?1",
@@ -1636,6 +1656,7 @@ fn invoice_by_id(conn: &Connection, id: i64) -> Result<Invoice> {
                     subtotal_cents: subtotal,
                     tax_cents: tax,
                     total_cents: subtotal + tax,
+                    credited_cents: row.get(10)?,
                     stock_deducted: row.get::<_, i64>(8)? != 0,
                     lines: Vec::new(),
                 },
@@ -1678,7 +1699,7 @@ pub fn save_invoice(conn: &mut Connection, input: &InvoiceInput) -> Result<Invoi
 /// Save an invoice inside a transaction the caller already owns, and return its
 /// id. The caller seals and commits, so an income record and the invoice it
 /// creates land in the file together or not at all.
-fn save_invoice_tx(
+pub(crate) fn save_invoice_tx(
     conn: &Connection,
     accounts: &InvoiceAccounts,
     input: &InvoiceInput,
@@ -1761,6 +1782,44 @@ fn save_invoice_tx(
         None => Vec::new(),
     };
 
+    // A credit memo freezes the invoice it credits. The status may still move
+    // between Sent and Paid, but the money on the invoice cannot change under a
+    // posted credit.
+    let already_credited: i64 = match input.id {
+        Some(id) => conn.query_row(
+            "SELECT COALESCE(SUM(total_cents), 0) FROM credit_memos
+              WHERE invoice_id = ?1 AND status <> 'Void'",
+            [id],
+            |row| row.get(0),
+        )?,
+        None => 0,
+    };
+    if already_credited > 0 {
+        let id = input.id.expect("credited invoices have an id");
+        let before = invoice_by_id(conn, id)?;
+        let same_lines = before.lines.len() == lines.len()
+            && before
+                .lines
+                .iter()
+                .zip(lines.iter())
+                .all(|(old, new)| {
+                    old.description == new.description.trim()
+                        && old.qty_hundredths == new.qty_hundredths
+                        && old.unit_price_cents == new.unit_price_cents
+                        && old.inventory_item_id == new.inventory_item_id
+                });
+        if !same_lines
+            || before.total_cents != total
+            || before.invoice_date != day
+            || before.customer_id != input.customer_id
+        {
+            return Err(CoreError::validation(format!(
+                "{} already has credit memos against it, so its lines and totals are fixed; void the credits first if the invoice itself was wrong",
+                before.invoice_no
+            )));
+        }
+    }
+
     if let Some((stock_deducted, ar, cash_entry, cogs_entry)) = &previous {
         if *stock_deducted {
             for line in &previous_lines {
@@ -1784,7 +1843,11 @@ fn save_invoice_tx(
                   WHERE id = ?1",
                 params![id, invoice_no, input.customer_id, day, due, status, tax_bp],
             )?;
-            conn.execute("DELETE FROM invoice_lines WHERE invoice_id = ?1", [id])?;
+            // Credit memos point at these lines, so a status-only change keeps
+            // them exactly where they are.
+            if already_credited == 0 {
+                conn.execute("DELETE FROM invoice_lines WHERE invoice_id = ?1", [id])?;
+            }
             id
         }
         None => {
@@ -1797,7 +1860,7 @@ fn save_invoice_tx(
         }
     };
 
-    {
+    if already_credited == 0 {
         let mut stmt = conn.prepare(
             "INSERT INTO invoice_lines
                 (invoice_id, position, description, qty_hundredths, unit_price_cents, inventory_item_id)
@@ -1858,14 +1921,19 @@ fn save_invoice_tx(
     }
 
     if status == "Paid" {
-        let entry = JournalEntryInput {
-            entry_date: day.clone(),
-            memo: format!("Payment received — invoice {invoice_no}"),
-            reference: Some(invoice_no.clone()),
-            source: EntrySource::Payment,
-            lines: vec![line(cash, total, 0), line(receivable, 0, total)],
-        };
-        cash_entry_id = Some(journal::post_in(conn, &entry)?.summary.id);
+        // Money only changes hands for the part of the invoice that credits have
+        // not already settled.
+        let due_cash = (total - already_credited).max(0);
+        if due_cash > 0 {
+            let entry = JournalEntryInput {
+                entry_date: day.clone(),
+                memo: format!("Payment received — invoice {invoice_no}"),
+                reference: Some(invoice_no.clone()),
+                source: EntrySource::Payment,
+                lines: vec![line(cash, due_cash, 0), line(receivable, 0, due_cash)],
+            };
+            cash_entry_id = Some(journal::post_in(conn, &entry)?.summary.id);
+        }
     }
 
     conn.execute(
@@ -1894,7 +1962,17 @@ pub fn delete_invoice(conn: &mut Connection, id: i64) -> Result<()> {
 /// Remove an invoice and everything it booked, inside a transaction the caller
 /// already owns. Used when the income record that created it goes away.
 fn delete_invoice_tx(conn: &Connection, id: i64) -> Result<()> {
-        let row = conn
+    let credits: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM credit_memos WHERE invoice_id = ?1 AND status <> 'Void'",
+        [id],
+        |row| row.get(0),
+    )?;
+    if credits > 0 {
+        return Err(CoreError::validation(
+            "this invoice has credit memos against it; void them before deleting the invoice",
+        ));
+    }
+    let row = conn
         .query_row(
             "SELECT stock_deducted, ar_entry_id, cash_entry_id, cogs_entry_id
                FROM invoices WHERE id = ?1",
@@ -1922,6 +2000,23 @@ fn delete_invoice_tx(conn: &Connection, id: i64) -> Result<()> {
     for entry in [row.1, row.2, row.3].into_iter().flatten() {
         journal::void_in(conn, entry)?;
     }
+    // A quote or order that pointed at this invoice is open again: the document
+    // it became no longer exists, so it is no longer frozen.
+    conn.execute(
+        "UPDATE estimates
+            SET converted_invoice_id = NULL,
+                converted_at = CASE WHEN converted_order_id IS NULL THEN NULL ELSE converted_at END
+          WHERE converted_invoice_id = ?1",
+        [id],
+    )?;
+    conn.execute(
+        "UPDATE sales_orders
+            SET invoice_id = NULL,
+                converted_at = NULL,
+                status = CASE WHEN status = 'Fulfilled' THEN 'Confirmed' ELSE status END
+          WHERE invoice_id = ?1",
+        [id],
+    )?;
     conn.execute("DELETE FROM invoice_lines WHERE invoice_id = ?1", [id])?;
     conn.execute("DELETE FROM invoices WHERE id = ?1", [id])?;
     Ok(())
@@ -1996,9 +2091,9 @@ fn next_occurrence(date: &str, frequency: &str) -> String {
     }
 }
 
-/// The line rules an invoice and a schedule share: blank rows are dropped and
-/// what is left has to make sense.
-fn checked_lines(lines: &[InvoiceLineInput]) -> Result<Vec<InvoiceLineInput>> {
+/// The line rules every document shares: blank rows are dropped and what is
+/// left has to make sense.
+pub(crate) fn checked_lines(lines: &[InvoiceLineInput]) -> Result<Vec<InvoiceLineInput>> {
     let mut checked = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         let position = index + 1;
@@ -2022,7 +2117,7 @@ fn checked_lines(lines: &[InvoiceLineInput]) -> Result<Vec<InvoiceLineInput>> {
         checked.push(line.clone());
     }
     if checked.is_empty() {
-        return Err(CoreError::validation("add at least one line to the invoice"));
+        return Err(CoreError::validation("add at least one line to the document"));
     }
     Ok(checked)
 }
@@ -2660,29 +2755,62 @@ pub fn delete_purchase(conn: &mut Connection, id: i64) -> Result<()> {
 // Payroll
 // ---------------------------------------------------------------------------
 
+pub const MARITAL_SINGLE: &str = "Single";
+pub const MARITAL_MARRIED: &str = "Married";
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PayrollInput {
     pub id: Option<i64>,
+    /// The employee record this run pays, when there is one. A name typed by
+    /// hand still works, which is how a one-off check gets paid.
+    #[serde(default)]
+    pub employee_id: Option<i64>,
     pub employee: String,
     pub pay_date: String,
     #[serde(default)]
     pub check_number: String,
+    /// Hourly pay. Ignored for a salary, which is quoted by the year.
     pub pay_rate_cents: i64,
+    /// Hourly or Salary. A pay run keeps the basis it was paid on.
+    #[serde(default = "hourly_pay")]
+    pub pay_type: String,
+    #[serde(default = "biweekly_pay")]
+    pub pay_frequency: String,
+    #[serde(default)]
+    pub salary_cents: i64,
     #[serde(default)]
     pub regular_hours_hundredths: i64,
     #[serde(default)]
     pub overtime_hours_hundredths: i64,
+    #[serde(default = "single_status")]
+    pub marital_status: String,
     #[serde(default)]
-    pub federal_cents: i64,
+    pub allowances: i64,
+    /// W-4 box 4(c): a flat amount on top of the calculated federal tax.
     #[serde(default)]
-    pub state_cents: i64,
-    #[serde(default)]
-    pub social_security_cents: i64,
-    #[serde(default)]
-    pub medicare_cents: i64,
+    pub extra_withholding_cents: i64,
     #[serde(default)]
     pub other_deductions_cents: i64,
+    /// Additions — money on the check that is not wages.
+    #[serde(default)]
+    pub pay_mileage: bool,
+    #[serde(default)]
+    pub pay_allowance: bool,
+    #[serde(default)]
+    pub allowance_cents: i64,
+}
+
+fn single_status() -> String {
+    MARITAL_SINGLE.to_string()
+}
+
+fn hourly_pay() -> String {
+    employees::PAY_HOURLY.to_string()
+}
+
+fn biweekly_pay() -> String {
+    employees::FREQ_BIWEEKLY.to_string()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2690,27 +2818,138 @@ pub struct PayrollInput {
 pub struct PayrollRun {
     pub id: i64,
     pub employee: String,
+    pub employee_id: Option<i64>,
     pub pay_date: String,
     pub check_number: String,
+    pub pay_type: String,
+    pub pay_frequency: String,
+    /// Hourly rate for an hourly run, 0 for a salaried one.
     pub pay_rate_cents: i64,
+    /// Annual salary for a salaried run, 0 for an hourly one.
+    pub salary_cents: i64,
+    /// Checks a year: 52, 26, 24 or 12. Zero for hourly pay.
+    pub periods_per_year: i64,
     pub regular_hours_hundredths: i64,
     pub overtime_hours_hundredths: i64,
     pub gross_cents: i64,
+    pub marital_status: String,
+    pub allowances: i64,
+    pub extra_withholding_cents: i64,
     pub federal_cents: i64,
     pub state_cents: i64,
     pub social_security_cents: i64,
     pub medicare_cents: i64,
     pub other_deductions_cents: i64,
     pub total_deductions_cents: i64,
+    /// Additions paid on top of wages: miles driven for the company and any
+    /// per-period allowance. They are not taxed and never touch gross pay.
+    pub mileage_hundredths: i64,
+    pub mileage_cents: i64,
+    pub allowance_cents: i64,
+    pub additions_cents: i64,
+    /// Take-home wages, before additions.
     pub net_cents: i64,
+    /// What the check is actually written for: net pay plus additions.
+    pub paid_cents: i64,
     pub journal_entry_id: Option<i64>,
+}
+
+/// What the engine withholds from one pay run. Every figure is a working
+/// estimate from settings, not a filed return.
+#[derive(Debug, Clone, Copy)]
+pub struct Withholding {
+    pub federal_cents: i64,
+    pub state_cents: i64,
+    pub social_security_cents: i64,
+    pub medicare_cents: i64,
+    pub allowance_cents: i64,
+    pub extra_cents: i64,
+}
+
+pub(crate) fn bp_setting(conn: &Connection, key: &str, fallback: i64) -> i64 {
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+        row.get::<_, String>(0)
+    })
+    .optional()
+    .ok()
+    .flatten()
+    .and_then(|value| value.trim().parse::<i64>().ok())
+    .unwrap_or(fallback)
+}
+
+/// Half-up rounding at a basis-point rate, so a rate of 6.2% on $1,000 is
+/// $62.00 rather than $61.99.
+fn apply_bp(amount_cents: i64, bp: i64) -> i64 {
+    (amount_cents * bp + 5_000) / 10_000
+}
+
+fn normalized_marital(value: &str) -> Result<&'static str> {
+    match value.trim() {
+        "" | "Single" | "single" => Ok(MARITAL_SINGLE),
+        "Married" | "married" => Ok(MARITAL_MARRIED),
+        other => Err(CoreError::validation(format!(
+            "'{other}' is not a marital status; use Single or Married"
+        ))),
+    }
+}
+
+/// Deductions for one pay run.
+///
+/// Every rate is a setting, never a constant: Social Security and Medicare
+/// change by law, federal and state rates change by policy, and the value of a
+/// withholding allowance changes with the tax tables. Federal withholding
+/// first takes the allowances out of the pay, then applies the single or
+/// married rate, and finally adds any extra amount the employee asked for on
+/// their W-4. Social Security and Medicare do not care about a filing status.
+pub fn withholding(
+    conn: &Connection,
+    gross_cents: i64,
+    marital_status: &str,
+    allowances: i64,
+    extra_withholding_cents: i64,
+) -> Result<Withholding> {
+    if gross_cents < 0 {
+        return Err(CoreError::validation("gross pay cannot be negative"));
+    }
+    if allowances < 0 {
+        return Err(CoreError::validation("allowances cannot be negative"));
+    }
+    if extra_withholding_cents < 0 {
+        return Err(CoreError::validation(
+            "extra withholding cannot be negative",
+        ));
+    }
+    let marital = normalized_marital(marital_status)?;
+    let allowance_value = bp_setting(conn, "payroll_allowance_cents", 19_400).max(0);
+    let federal_bp = if marital == MARITAL_MARRIED {
+        bp_setting(conn, "payroll_federal_married_bp", 800)
+    } else {
+        bp_setting(conn, "payroll_federal_single_bp", 1_200)
+    };
+    let state_bp = bp_setting(conn, "payroll_state_bp", 400);
+    let social_security_bp = bp_setting(conn, "payroll_social_security_bp", 620).max(0);
+    let medicare_bp = bp_setting(conn, "payroll_medicare_bp", 145).max(0);
+    let allowance_cents = allowance_value * allowances;
+    let federal_base = (gross_cents - allowance_cents).max(0);
+
+    Ok(Withholding {
+        federal_cents: (apply_bp(federal_base, federal_bp) + extra_withholding_cents)
+            .min(gross_cents),
+        state_cents: apply_bp(gross_cents, state_bp),
+        social_security_cents: apply_bp(gross_cents, social_security_bp),
+        medicare_cents: apply_bp(gross_cents, medicare_bp),
+        allowance_cents,
+        extra_cents: extra_withholding_cents,
+    })
 }
 
 const SELECT_PAYROLL: &str = r#"
 SELECT id, employee, pay_date, check_number, pay_rate_cents, regular_hours_hundredths,
        overtime_hours_hundredths, gross_cents, federal_cents, state_cents,
        social_security_cents, medicare_cents, other_deductions_cents, net_cents,
-       journal_entry_id
+       journal_entry_id, marital_status, allowances, employee_id,
+       extra_withholding_cents, mileage_hundredths, mileage_cents, allowance_cents,
+       additions_cents, pay_type, pay_frequency, salary_cents
 FROM payroll_runs
 "#;
 
@@ -2720,22 +2959,43 @@ fn map_payroll(row: &rusqlite::Row<'_>) -> rusqlite::Result<PayrollRun> {
     let ss: i64 = row.get(10)?;
     let medicare: i64 = row.get(11)?;
     let other: i64 = row.get(12)?;
+    let net: i64 = row.get(13)?;
+    let additions: i64 = row.get(22)?;
+    let pay_type: String = row.get(23)?;
+    let pay_frequency: String = row.get(24)?;
     Ok(PayrollRun {
         id: row.get(0)?,
         employee: row.get(1)?,
         pay_date: row.get(2)?,
         check_number: row.get(3)?,
+        pay_type: pay_type.clone(),
+        pay_frequency: pay_frequency.clone(),
+        periods_per_year: if pay_type == employees::PAY_SALARY {
+            employees::periods_per_year(&pay_frequency)
+        } else {
+            0
+        },
+        salary_cents: row.get(25)?,
         pay_rate_cents: row.get(4)?,
         regular_hours_hundredths: row.get(5)?,
         overtime_hours_hundredths: row.get(6)?,
         gross_cents: row.get(7)?,
+        marital_status: row.get(15)?,
+        allowances: row.get(16)?,
+        employee_id: row.get(17)?,
+        extra_withholding_cents: row.get(18)?,
+        mileage_hundredths: row.get(19)?,
+        mileage_cents: row.get(20)?,
+        allowance_cents: row.get(21)?,
+        additions_cents: additions,
         federal_cents: federal,
         state_cents: state,
         social_security_cents: ss,
         medicare_cents: medicare,
         other_deductions_cents: other,
         total_deductions_cents: federal + state + ss + medicare + other,
-        net_cents: row.get(13)?,
+        net_cents: net,
+        paid_cents: net + additions,
         journal_entry_id: row.get(14)?,
     })
 }
@@ -2755,34 +3015,238 @@ fn payroll_by_id(conn: &Connection, id: i64) -> Result<PayrollRun> {
         .ok_or_else(|| CoreError::not_found(format!("pay run {id} does not exist")))
 }
 
-pub fn save_payroll(conn: &mut Connection, input: &PayrollInput) -> Result<PayrollRun> {
-    let employee = required_text(&input.employee, "an employee name")?;
+/// Everything a pay run needs, worked out from hours, rate, marital status and
+/// allowances. Shared by the saved run and the live preview, so the figure on
+/// the screen is the figure that lands in the file.
+struct PayrollFigures {
+    employee: String,
+    employee_record: Option<employees::Employee>,
+    day: String,
+    pay_type: &'static str,
+    pay_frequency: &'static str,
+    /// The hourly rate for an hourly run, zero for a salaried one.
+    rate: i64,
+    /// The annual salary for a salaried run, zero for an hourly one.
+    salary: i64,
+    gross: i64,
+    marital_status: &'static str,
+    allowances: i64,
+    extra_withholding: i64,
+    withholding: Withholding,
+    other_deductions: i64,
+    total_deductions: i64,
+    net: i64,
+    mileage_hundredths: i64,
+    mileage: i64,
+    allowance: i64,
+    additions: i64,
+}
+
+fn payroll_figures(conn: &Connection, input: &PayrollInput) -> Result<PayrollFigures> {
+    let employee_record = employees::find_by_id(conn, input.employee_id)?;
+    let typed = input.employee.trim();
+    let employee = if typed.is_empty() {
+        match employee_record.as_ref() {
+            Some(record) => record.name.clone(),
+            None => return Err(CoreError::validation("choose an employee for this pay run")),
+        }
+    } else {
+        required_text(typed, "an employee name")?
+    };
     let day = checked_date(&input.pay_date, "the pay date")?;
-    if input.pay_rate_cents < 0 {
-        return Err(CoreError::validation("the pay rate cannot be negative"));
+    for (amount, what) in [
+        (input.pay_rate_cents, "the pay rate"),
+        (input.regular_hours_hundredths, "the hours"),
+        (input.overtime_hours_hundredths, "the overtime hours"),
+        (input.other_deductions_cents, "other deductions"),
+        (input.extra_withholding_cents, "extra withholding"),
+        (input.allowance_cents, "the allowance"),
+    ] {
+        if amount < 0 {
+            return Err(CoreError::validation(format!("{what} cannot be negative")));
+        }
     }
-    if input.regular_hours_hundredths < 0 || input.overtime_hours_hundredths < 0 {
-        return Err(CoreError::validation("hours cannot be negative"));
-    }
-    let overtime_rate = input.pay_rate_cents * 3 / 2;
-    let gross = line_total(input.regular_hours_hundredths, input.pay_rate_cents)
-        + line_total(input.overtime_hours_hundredths, overtime_rate);
-    let deductions = input.federal_cents
-        + input.state_cents
-        + input.social_security_cents
-        + input.medicare_cents
-        + input.other_deductions_cents;
-    if gross <= 0 {
+    if input.pay_mileage && employee_record.is_none() {
         return Err(CoreError::validation(
-            "enter hours and a pay rate so the pay run is worth something",
+            "mileage is reimbursed to an employee record; add this person under Employees first",
         ));
     }
-    if deductions < 0 || deductions > gross {
+
+    // Pay is either hours at a rate or a yearly salary cut into equal periods.
+    // The basis travels with the run, so a later raise cannot change what an old
+    // check was worked out from.
+    let pay_type = employees::normalized_pay_type(&input.pay_type)?;
+    let pay_frequency = employees::normalized_frequency(&input.pay_frequency)?;
+    let periods = employees::periods_per_year(pay_frequency);
+    let gross = if pay_type == employees::PAY_SALARY {
+        if input.salary_cents <= 0 {
+            return Err(CoreError::validation(
+                "enter an annual salary for this salaried pay run",
+            ));
+        }
+        if input.regular_hours_hundredths > 0 || input.overtime_hours_hundredths > 0 {
+            return Err(CoreError::validation(
+                "a salary is a fixed amount each period; clear the hours, or record extra pay as an addition",
+            ));
+        }
+        // Half-up, so $70,000 a year twice a month is $2,916.67 rather than
+        // $2,916.66 forever.
+        (input.salary_cents + periods / 2) / periods
+    } else {
+        let overtime_rate = input.pay_rate_cents * 3 / 2;
+        line_total(input.regular_hours_hundredths, input.pay_rate_cents)
+            + line_total(input.overtime_hours_hundredths, overtime_rate)
+    };
+    if gross <= 0 {
+        return Err(CoreError::validation(if pay_type == employees::PAY_SALARY {
+            "the salary is too small to make a payment"
+        } else {
+            "enter hours and a pay rate so the pay run is worth something"
+        }));
+    }
+    let marital_status = normalized_marital(&input.marital_status)?;
+    let withholding = withholding(
+        conn,
+        gross,
+        marital_status,
+        input.allowances,
+        input.extra_withholding_cents,
+    )?;
+    let total_deductions = withholding.federal_cents
+        + withholding.state_cents
+        + withholding.social_security_cents
+        + withholding.medicare_cents
+        + input.other_deductions_cents;
+    if total_deductions > gross {
         return Err(CoreError::validation(
             "deductions cannot exceed gross pay",
         ));
     }
-    let net = gross - deductions;
+
+    // Additions. Miles come from the employee's own unreimbursed log at the
+    // rate in Settings; the allowance is whatever the employee record says per
+    // pay period. Neither is taxed, so neither joins gross pay.
+    let mileage = if input.pay_mileage {
+        // On an edit, miles this same run already claimed still count.
+        employees::mileage_due(conn, employee_record.as_ref(), input.id)?
+    } else {
+        employees::MileageDue {
+            miles_hundredths: 0,
+            rate_cents: 0,
+            amount_cents: 0,
+            linked: true,
+        }
+    };
+    let allowance = if input.pay_allowance {
+        input.allowance_cents
+    } else {
+        0
+    };
+
+    Ok(PayrollFigures {
+        employee,
+        employee_record,
+        day,
+        pay_type,
+        pay_frequency,
+        rate: if pay_type == employees::PAY_SALARY {
+            0
+        } else {
+            input.pay_rate_cents
+        },
+        salary: if pay_type == employees::PAY_SALARY {
+            input.salary_cents
+        } else {
+            0
+        },
+        gross,
+        marital_status,
+        allowances: input.allowances,
+        extra_withholding: input.extra_withholding_cents,
+        withholding,
+        other_deductions: input.other_deductions_cents,
+        total_deductions,
+        net: gross - total_deductions,
+        mileage_hundredths: mileage.miles_hundredths,
+        mileage: mileage.amount_cents,
+        allowance,
+        additions: mileage.amount_cents + allowance,
+    })
+}
+
+/// The same figures without writing anything, so the composer can show the
+/// breakdown before the pay run is saved.
+pub fn preview_payroll(conn: &Connection, input: &PayrollInput) -> Result<PayrollRun> {
+    let figures = payroll_figures(conn, input)?;
+    Ok(PayrollRun {
+        id: input.id.unwrap_or(0),
+        employee: figures.employee,
+        employee_id: input.employee_id,
+        pay_date: figures.day,
+        check_number: input.check_number.trim().to_string(),
+        pay_type: figures.pay_type.to_string(),
+        pay_frequency: figures.pay_frequency.to_string(),
+        periods_per_year: if figures.pay_type == employees::PAY_SALARY {
+            employees::periods_per_year(figures.pay_frequency)
+        } else {
+            0
+        },
+        salary_cents: figures.salary,
+        pay_rate_cents: figures.rate,
+        regular_hours_hundredths: if figures.pay_type == employees::PAY_SALARY {
+            0
+        } else {
+            input.regular_hours_hundredths
+        },
+        overtime_hours_hundredths: input.overtime_hours_hundredths,
+        gross_cents: figures.gross,
+        marital_status: figures.marital_status.to_string(),
+        allowances: figures.allowances,
+        extra_withholding_cents: figures.extra_withholding,
+        federal_cents: figures.withholding.federal_cents,
+        state_cents: figures.withholding.state_cents,
+        social_security_cents: figures.withholding.social_security_cents,
+        medicare_cents: figures.withholding.medicare_cents,
+        other_deductions_cents: figures.other_deductions,
+        total_deductions_cents: figures.total_deductions,
+        mileage_hundredths: figures.mileage_hundredths,
+        mileage_cents: figures.mileage,
+        allowance_cents: figures.allowance,
+        additions_cents: figures.additions,
+        net_cents: figures.net,
+        paid_cents: figures.net + figures.additions,
+        journal_entry_id: None,
+    })
+}
+
+pub fn save_payroll(conn: &mut Connection, input: &PayrollInput) -> Result<PayrollRun> {
+    // Account roles are resolved before the write transaction: creating a
+    // missing role account needs a transaction of its own. The figures are
+    // worked out here too, and the write below either commits all of it or
+    // none of it.
+    let figures = payroll_figures(conn, input)?;
+    let PayrollFigures {
+        employee,
+        employee_record,
+        day,
+        pay_type,
+        pay_frequency,
+        rate,
+        salary,
+        gross,
+        marital_status,
+        allowances,
+        extra_withholding,
+        withholding,
+        other_deductions,
+        total_deductions,
+        net,
+        mileage_hundredths,
+        mileage,
+        allowance,
+        additions,
+    } = figures;
+    let deductions = total_deductions;
 
     let cash = cash_account(conn)?;
     let payroll_expense = role_account(
@@ -2801,8 +3265,27 @@ pub fn save_payroll(conn: &mut Connection, input: &PayrollInput) -> Result<Payro
         AccountType::Liability,
         "Other Current Liability",
     )?;
+    // Reimbursed miles and an allowance are not wages: they are a cost of doing
+    // business paid to the employee, so they get their own expense account
+    // instead of inflating wage expense (and with it the W-2 wage box).
+    let additions_account = if additions > 0 {
+        Some(role_account(
+            conn,
+            ROLE_PAYROLL_ADDITIONS,
+            "6310",
+            "Employee Reimbursements",
+            AccountType::Expense,
+            "Payroll",
+        )?)
+    } else {
+        None
+    };
 
-    let mut lines = vec![line(payroll_expense, gross, 0), line(cash, 0, net)];
+    let mut lines = vec![line(payroll_expense, gross, 0)];
+    if let Some(account) = additions_account {
+        lines.push(line(account, additions, 0));
+    }
+    lines.push(line(cash, 0, net + additions));
     if deductions > 0 {
         lines.push(line(payroll_liability, 0, deductions));
     }
@@ -2816,7 +3299,14 @@ pub fn save_payroll(conn: &mut Connection, input: &PayrollInput) -> Result<Payro
     };
 
     let tx = conn.transaction()?;
+
+    // Re-editing a run releases the miles it paid, so the read above counted
+    // them as available and the claim below can pay them again exactly once.
     if let Some(id) = input.id {
+        tx.execute(
+            "UPDATE time_entries SET reimbursed_run_id = NULL WHERE reimbursed_run_id = ?1",
+            [id],
+        )?;
         let previous: Option<Option<i64>> = tx
             .query_row(
                 "SELECT journal_entry_id FROM payroll_runs WHERE id = ?1",
@@ -2840,25 +3330,41 @@ pub fn save_payroll(conn: &mut Connection, input: &PayrollInput) -> Result<Payro
                 "UPDATE payroll_runs
                     SET employee = ?2, pay_date = ?3, check_number = ?4, pay_rate_cents = ?5,
                         regular_hours_hundredths = ?6, overtime_hours_hundredths = ?7,
-                        gross_cents = ?8, federal_cents = ?9, state_cents = ?10,
-                        social_security_cents = ?11, medicare_cents = ?12,
-                        other_deductions_cents = ?13, net_cents = ?14, journal_entry_id = NULL
+                        gross_cents = ?8, marital_status = ?9, allowances = ?10,
+                        federal_cents = ?11, state_cents = ?12,
+                        social_security_cents = ?13, medicare_cents = ?14,
+                        other_deductions_cents = ?15, net_cents = ?16, journal_entry_id = NULL,
+                        employee_id = ?17, extra_withholding_cents = ?18,
+                        mileage_hundredths = ?19, mileage_cents = ?20,
+                        allowance_cents = ?21, additions_cents = ?22,
+                        pay_type = ?23, pay_frequency = ?24, salary_cents = ?25
                   WHERE id = ?1",
                 params![
                     id,
                     employee,
                     day,
                     input.check_number.trim(),
-                    input.pay_rate_cents,
+                    rate,
                     input.regular_hours_hundredths,
                     input.overtime_hours_hundredths,
                     gross,
-                    input.federal_cents,
-                    input.state_cents,
-                    input.social_security_cents,
-                    input.medicare_cents,
-                    input.other_deductions_cents,
-                    net
+                    marital_status,
+                    allowances,
+                    withholding.federal_cents,
+                    withholding.state_cents,
+                    withholding.social_security_cents,
+                    withholding.medicare_cents,
+                    other_deductions,
+                    net,
+                    input.employee_id,
+                    extra_withholding,
+                    mileage_hundredths,
+                    mileage,
+                    allowance,
+                    additions,
+                    pay_type,
+                    pay_frequency,
+                    salary
                 ],
             )?;
             id
@@ -2868,28 +3374,47 @@ pub fn save_payroll(conn: &mut Connection, input: &PayrollInput) -> Result<Payro
                 "INSERT INTO payroll_runs
                     (employee, pay_date, check_number, pay_rate_cents,
                      regular_hours_hundredths, overtime_hours_hundredths, gross_cents,
-                     federal_cents, state_cents, social_security_cents, medicare_cents,
-                     other_deductions_cents, net_cents)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                     marital_status, allowances, federal_cents, state_cents,
+                     social_security_cents, medicare_cents, other_deductions_cents, net_cents,
+                     employee_id, extra_withholding_cents, mileage_hundredths, mileage_cents,
+                     allowance_cents, additions_cents,
+                     pay_type, pay_frequency, salary_cents)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                         ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                 params![
                     employee,
                     day,
                     input.check_number.trim(),
-                    input.pay_rate_cents,
+                    rate,
                     input.regular_hours_hundredths,
                     input.overtime_hours_hundredths,
                     gross,
-                    input.federal_cents,
-                    input.state_cents,
-                    input.social_security_cents,
-                    input.medicare_cents,
-                    input.other_deductions_cents,
-                    net
+                    marital_status,
+                    allowances,
+                    withholding.federal_cents,
+                    withholding.state_cents,
+                    withholding.social_security_cents,
+                    withholding.medicare_cents,
+                    other_deductions,
+                    net,
+                    input.employee_id,
+                    extra_withholding,
+                    mileage_hundredths,
+                    mileage,
+                    allowance,
+                    additions,
+                    pay_type,
+                    pay_frequency,
+                    salary
                 ],
             )?;
             tx.last_insert_rowid()
         }
     };
+
+    if input.pay_mileage {
+        employees::claim_mileage(&tx, employee_record.as_ref(), id)?;
+    }
 
     let posted = journal::post_in(&tx, &entry)?;
     tx.execute(

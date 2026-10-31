@@ -1,7 +1,7 @@
 //! Company file schema. Each company lives in its own SQLite file, so the
 //! schema is per-file and migrations are tracked with `PRAGMA user_version`.
 
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 8;
 
 /// Everything a company file needs, including the invariants that must hold
 /// even if a future UI (or a hand-written SQL session) bypasses this crate.
@@ -371,6 +371,342 @@ const RECURRING_AUDITED: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// Schema v5 — the documents that come before an invoice. An estimate is a
+/// quote, a sales order is a confirmed commitment, and neither posts anything:
+/// they only become money when they are turned into an invoice. The same
+/// migration carries the payroll facts that change withholding (marital status
+/// and withholding allowances).
+/// Schema v6 — employees as their own record, and pay runs that can pay more
+/// than wages.
+///
+/// An employee is not a user: payroll needs a W-4 and W-2 for people who never
+/// open this file. The two records are linked only when it helps (mileage is
+/// logged by a user), and the link is optional. Pay runs gained the additions
+/// that ride on top of net pay — mileage reimbursement and a per-period
+/// allowance — plus the W-4 extra withholding that is added after the rates.
+pub fn migration_6() -> String {
+    let mut sql = String::from(MIGRATION_6_DDL);
+    for (table, columns) in EMPLOYEE_AUDITED {
+        sql.push_str(&audit_triggers(table, columns));
+    }
+    // payroll_runs gained additions and the employee link, so its audit image
+    // is rebuilt to include them.
+    for trigger in ["ins", "upd", "del"] {
+        sql.push_str(&format!(
+            "DROP TRIGGER IF EXISTS trg_audit_payroll_runs_{trigger};\n"
+        ));
+    }
+    sql.push_str(&audit_triggers("payroll_runs", PAYROLL_AUDITED_V6));
+    // Mileage now records the pay run that reimbursed it.
+    for trigger in ["ins", "upd", "del"] {
+        sql.push_str(&format!(
+            "DROP TRIGGER IF EXISTS trg_audit_time_entries_{trigger};\n"
+        ));
+    }
+    sql.push_str(&audit_triggers("time_entries", TIME_AUDITED_V6));
+    sql
+}
+
+/// v8 widens the access level a user can hold. A `CHECK` cannot be altered in
+/// SQLite, so the table is rebuilt with its rows intact.
+pub fn migration_8() -> String {
+    MIGRATION_8_DDL.to_string()
+}
+
+pub fn migration_7() -> String {
+    let mut sql = String::from(MIGRATION_7_DDL);
+    // Both tables gained columns the audit image has to name, so their triggers
+    // are rebuilt rather than left pointing at the old column list.
+    for table in ["employees", "payroll_runs"] {
+        for trigger in ["ins", "upd", "del"] {
+            sql.push_str(&format!(
+                "DROP TRIGGER IF EXISTS trg_audit_{table}_{trigger};\n"
+            ));
+        }
+    }
+    sql.push_str(&audit_triggers("employees", EMPLOYEE_AUDITED_V7));
+    sql.push_str(&audit_triggers("payroll_runs", PAYROLL_AUDITED_V7));
+    sql
+}
+
+const EMPLOYEE_AUDITED_V7: &[&str] = &[
+    "id",
+    "name",
+    "employee_no",
+    "email",
+    "phone",
+    "address",
+    "ssn",
+    "ssn_last4",
+    "hire_date",
+    "job_title",
+    "user_id",
+    "filing_status",
+    "allowances",
+    "extra_withholding_cents",
+    "pay_type",
+    "pay_frequency",
+    "pay_rate_cents",
+    "salary_cents",
+    "allowance_cents",
+    "mileage_reimbursement",
+    "is_active",
+];
+
+const PAYROLL_AUDITED_V7: &[&str] = &[
+    "id",
+    "employee",
+    "employee_id",
+    "pay_date",
+    "check_number",
+    "pay_type",
+    "pay_frequency",
+    "pay_rate_cents",
+    "salary_cents",
+    "regular_hours_hundredths",
+    "overtime_hours_hundredths",
+    "gross_cents",
+    "marital_status",
+    "allowances",
+    "extra_withholding_cents",
+    "federal_cents",
+    "state_cents",
+    "social_security_cents",
+    "medicare_cents",
+    "other_deductions_cents",
+    "mileage_hundredths",
+    "mileage_cents",
+    "allowance_cents",
+    "additions_cents",
+    "net_cents",
+    "journal_entry_id",
+];
+
+const EMPLOYEE_AUDITED: &[(&str, &[&str])] = &[(
+    "employees",
+    &[
+        "id",
+        "name",
+        "employee_no",
+        "email",
+        "phone",
+        "address",
+        "ssn_last4",
+        "hire_date",
+        "job_title",
+        "user_id",
+        "filing_status",
+        "allowances",
+        "extra_withholding_cents",
+        "pay_rate_cents",
+        "allowance_cents",
+        "mileage_reimbursement",
+        "is_active",
+    ],
+)];
+
+const TIME_AUDITED_V6: &[&str] = &[
+    "id",
+    "user_id",
+    "entered_by",
+    "entry_date",
+    "kind",
+    "description",
+    "customer",
+    "quantity_hundredths",
+    "rate_cents",
+    "is_billable",
+    "reimbursed_run_id",
+];
+
+const PAYROLL_AUDITED_V6: &[&str] = &[
+    "id",
+    "employee",
+    "employee_id",
+    "pay_date",
+    "check_number",
+    "pay_rate_cents",
+    "regular_hours_hundredths",
+    "overtime_hours_hundredths",
+    "gross_cents",
+    "marital_status",
+    "allowances",
+    "extra_withholding_cents",
+    "federal_cents",
+    "state_cents",
+    "social_security_cents",
+    "medicare_cents",
+    "other_deductions_cents",
+    "mileage_hundredths",
+    "mileage_cents",
+    "allowance_cents",
+    "additions_cents",
+    "net_cents",
+    "journal_entry_id",
+];
+
+pub fn migration_5() -> String {
+    let mut sql = String::from(MIGRATION_5_DDL);
+    for (table, columns) in PIPELINE_AUDITED {
+        sql.push_str(&audit_triggers(table, columns));
+    }
+    // pay runs gained two audited columns, so their triggers are rebuilt to
+    // capture them in the before/after image.
+    for trigger in ["ins", "upd", "del"] {
+        sql.push_str(&format!(
+            "DROP TRIGGER IF EXISTS trg_audit_payroll_runs_{trigger};\n"
+        ));
+    }
+    sql.push_str(&audit_triggers("payroll_runs", PAYROLL_AUDITED_V5));
+    sql
+}
+
+const PIPELINE_AUDITED: &[(&str, &[&str])] = &[
+    (
+        "estimates",
+        &[
+            "id",
+            "estimate_no",
+            "customer_id",
+            "estimate_date",
+            "expiry_date",
+            "status",
+            "tax_bp",
+            "notes",
+            "converted_order_id",
+            "converted_invoice_id",
+            "converted_at",
+        ],
+    ),
+    (
+        "estimate_lines",
+        &[
+            "id",
+            "estimate_id",
+            "position",
+            "description",
+            "qty_hundredths",
+            "unit_price_cents",
+            "inventory_item_id",
+        ],
+    ),
+    (
+        "sales_orders",
+        &[
+            "id",
+            "order_no",
+            "customer_id",
+            "order_date",
+            "requested_date",
+            "status",
+            "tax_bp",
+            "notes",
+            "invoice_id",
+            "converted_at",
+        ],
+    ),
+    (
+        "sales_order_lines",
+        &[
+            "id",
+            "order_id",
+            "position",
+            "description",
+            "qty_hundredths",
+            "unit_price_cents",
+            "inventory_item_id",
+        ],
+    ),
+];
+
+const PAYROLL_AUDITED_V5: &[&str] = &[
+    "id",
+    "employee",
+    "pay_date",
+    "check_number",
+    "pay_rate_cents",
+    "regular_hours_hundredths",
+    "overtime_hours_hundredths",
+    "gross_cents",
+    "marital_status",
+    "allowances",
+    "federal_cents",
+    "state_cents",
+    "social_security_cents",
+    "medicare_cents",
+    "other_deductions_cents",
+    "net_cents",
+    "journal_entry_id",
+];
+
+/// Schema v4 — credit memos against issued invoices, the people who use the
+/// file and the access level each of them has, and billable time and mileage.
+pub fn migration_4() -> String {
+    let mut sql = String::from(MIGRATION_4_DDL);
+    for (table, columns) in CREDIT_AUDITED {
+        sql.push_str(&audit_triggers(table, columns));
+    }
+    sql
+}
+
+const CREDIT_AUDITED: &[(&str, &[&str])] = &[
+    (
+        "credit_memos",
+        &[
+            "id",
+            "memo_no",
+            "invoice_id",
+            "customer_id",
+            "memo_date",
+            "reason",
+            "status",
+            "outcome",
+            "tax_bp",
+            "subtotal_cents",
+            "tax_cents",
+            "total_cents",
+            "stock_returned",
+            "issue_entry_id",
+            "settlement_entry_id",
+            "cogs_entry_id",
+            "posted_at",
+            "voided_at",
+        ],
+    ),
+    (
+        "credit_memo_lines",
+        &[
+            "id",
+            "memo_id",
+            "invoice_line_id",
+            "position",
+            "description",
+            "qty_hundredths",
+            "unit_price_cents",
+            "inventory_item_id",
+        ],
+    ),
+    (
+        "users",
+        &["id", "name", "email", "access", "is_active"],
+    ),
+    (
+        "time_entries",
+        &[
+            "id",
+            "user_id",
+            "entered_by",
+            "entry_date",
+            "kind",
+            "description",
+            "customer",
+            "quantity_hundredths",
+            "rate_cents",
+            "is_billable",
+        ],
+    ),
+];
+
 fn audit_triggers(table: &str, columns: &[&str]) -> String {
     let after = json_image(columns, "NEW");
     let before = json_image(columns, "OLD");
@@ -596,4 +932,477 @@ CREATE TABLE recurring_invoice_lines (
     inventory_item_id INTEGER REFERENCES inventory_items(id) ON DELETE SET NULL,
     UNIQUE (recurring_id, position)
 );
+"#;
+
+const MIGRATION_4_DDL: &str = r#"
+-- A credit memo is always built on an invoice that has already been issued, so
+-- the credit can never exist without the charge it reduces.
+CREATE TABLE credit_memos (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    memo_no             TEXT    NOT NULL UNIQUE CHECK (length(trim(memo_no)) > 0),
+    invoice_id          INTEGER NOT NULL REFERENCES invoices(id) ON DELETE RESTRICT,
+    customer_id         INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+    memo_date           TEXT    NOT NULL CHECK (memo_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+    reason              TEXT    NOT NULL DEFAULT '',
+    status              TEXT    NOT NULL DEFAULT 'Draft' CHECK (status IN ('Draft', 'Posted', 'Void')),
+    outcome             TEXT    NOT NULL DEFAULT 'Apply' CHECK (outcome IN ('Apply', 'Refund', 'Credit')),
+    tax_bp              INTEGER NOT NULL DEFAULT 0 CHECK (tax_bp BETWEEN 0 AND 10000),
+    subtotal_cents      INTEGER NOT NULL DEFAULT 0 CHECK (subtotal_cents >= 0),
+    tax_cents           INTEGER NOT NULL DEFAULT 0 CHECK (tax_cents >= 0),
+    total_cents         INTEGER NOT NULL DEFAULT 0 CHECK (total_cents >= 0),
+    stock_returned      INTEGER NOT NULL DEFAULT 0 CHECK (stock_returned IN (0, 1)),
+    issue_entry_id      INTEGER REFERENCES journal_entries(id) ON DELETE RESTRICT,
+    settlement_entry_id INTEGER REFERENCES journal_entries(id) ON DELETE RESTRICT,
+    cogs_entry_id       INTEGER REFERENCES journal_entries(id) ON DELETE RESTRICT,
+    posted_at           TEXT,
+    voided_at           TEXT,
+    created_by          TEXT    NOT NULL DEFAULT '',
+    created_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX idx_credit_memos_invoice ON credit_memos(invoice_id);
+CREATE INDEX idx_credit_memos_status  ON credit_memos(status);
+
+CREATE TABLE credit_memo_lines (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    memo_id           INTEGER NOT NULL REFERENCES credit_memos(id) ON DELETE CASCADE,
+    invoice_line_id   INTEGER REFERENCES invoice_lines(id) ON DELETE SET NULL,
+    position          INTEGER NOT NULL CHECK (position > 0),
+    description       TEXT    NOT NULL DEFAULT '',
+    qty_hundredths    INTEGER NOT NULL DEFAULT 0 CHECK (qty_hundredths >= 0),
+    unit_price_cents  INTEGER NOT NULL DEFAULT 0 CHECK (unit_price_cents >= 0),
+    inventory_item_id INTEGER REFERENCES inventory_items(id) ON DELETE SET NULL,
+    UNIQUE (memo_id, position)
+);
+
+-- People who use this company file, and the level of access each one has.
+CREATE TABLE users (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT    NOT NULL CHECK (length(trim(name)) > 0),
+    email      TEXT    NOT NULL DEFAULT '',
+    access     TEXT    NOT NULL DEFAULT 'Standard'
+                       CHECK (access IN ('Admin', 'Standard', 'TimeEntry', 'ReadOnly')),
+    is_active  INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+    created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE UNIQUE INDEX idx_users_name ON users(lower(name));
+
+-- Billable hours and miles. These are not posted to the journal until they are
+-- billed, which is why they carry the person who entered them.
+CREATE TABLE time_entries (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id             INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    entered_by          TEXT    NOT NULL DEFAULT '',
+    entry_date          TEXT    NOT NULL CHECK (entry_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+    kind                TEXT    NOT NULL DEFAULT 'Time' CHECK (kind IN ('Time', 'Mileage')),
+    description         TEXT    NOT NULL DEFAULT '',
+    customer            TEXT    NOT NULL DEFAULT '',
+    quantity_hundredths INTEGER NOT NULL CHECK (quantity_hundredths > 0),
+    rate_cents          INTEGER NOT NULL DEFAULT 0 CHECK (rate_cents >= 0),
+    is_billable         INTEGER NOT NULL DEFAULT 1 CHECK (is_billable IN (0, 1)),
+    created_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX idx_time_entries_user ON time_entries(user_id);
+CREATE INDEX idx_time_entries_date ON time_entries(entry_date);
+
+-- The first user is the owner, with full access. Switching users changes the
+-- name the audit triggers write, so the trail names a person, not the machine.
+INSERT INTO users (name, access) VALUES ('Owner', 'Admin');
+INSERT INTO settings (key, value)
+VALUES ('current_user_id', (SELECT CAST(id AS TEXT) FROM users WHERE name = 'Owner'));
+
+-- A credit memo's money is frozen the moment it is posted. Corrections are a
+-- void plus a new memo, never an edit, so the paper trail matches the books.
+CREATE TRIGGER trg_credit_memo_posted_immutable
+BEFORE UPDATE ON credit_memos
+WHEN OLD.status = 'Posted'
+ AND NEW.status = 'Posted'
+ AND (NEW.invoice_id     IS NOT OLD.invoice_id
+   OR NEW.customer_id    IS NOT OLD.customer_id
+   OR NEW.memo_date      IS NOT OLD.memo_date
+   OR NEW.reason         IS NOT OLD.reason
+   OR NEW.outcome        IS NOT OLD.outcome
+   OR NEW.tax_bp         IS NOT OLD.tax_bp
+   OR NEW.subtotal_cents IS NOT OLD.subtotal_cents
+   OR NEW.tax_cents      IS NOT OLD.tax_cents
+   OR NEW.total_cents    IS NOT OLD.total_cents)
+BEGIN
+    SELECT RAISE(ABORT, 'a posted credit memo cannot be edited; void it and issue a new one');
+END;
+
+CREATE TRIGGER trg_credit_memo_lines_ins
+BEFORE INSERT ON credit_memo_lines
+WHEN (SELECT status FROM credit_memos WHERE id = NEW.memo_id) <> 'Draft'
+BEGIN
+    SELECT RAISE(ABORT, 'credit memo lines can only change while the memo is a draft');
+END;
+
+CREATE TRIGGER trg_credit_memo_lines_upd
+BEFORE UPDATE ON credit_memo_lines
+WHEN (SELECT status FROM credit_memos WHERE id = NEW.memo_id) <> 'Draft'
+BEGIN
+    SELECT RAISE(ABORT, 'credit memo lines can only change while the memo is a draft');
+END;
+
+CREATE TRIGGER trg_credit_memo_lines_del
+BEFORE DELETE ON credit_memo_lines
+WHEN (SELECT status FROM credit_memos WHERE id = OLD.memo_id) <> 'Draft'
+BEGIN
+    SELECT RAISE(ABORT, 'credit memo lines can only change while the memo is a draft');
+END;
+
+-- A posted memo stays on the books; voiding is the only way out.
+CREATE TRIGGER trg_credit_memo_no_delete_posted
+BEFORE DELETE ON credit_memos
+WHEN OLD.status <> 'Draft'
+BEGIN
+    SELECT RAISE(ABORT, 'a posted or voided credit memo cannot be deleted; void it instead');
+END;
+
+-- There must always be someone who can administer the file.
+CREATE TRIGGER trg_users_keep_an_admin_upd
+BEFORE UPDATE OF access, is_active ON users
+WHEN OLD.access = 'Admin'
+ AND OLD.is_active = 1
+ AND (NEW.access <> 'Admin' OR NEW.is_active <> 1)
+ AND (SELECT COUNT(*) FROM users
+       WHERE access = 'Admin' AND is_active = 1 AND id <> OLD.id) = 0
+BEGIN
+    SELECT RAISE(ABORT, 'this is the last admin; promote someone else before changing this user');
+END;
+
+CREATE TRIGGER trg_users_keep_an_admin_del
+BEFORE DELETE ON users
+WHEN OLD.access = 'Admin'
+ AND OLD.is_active = 1
+ AND (SELECT COUNT(*) FROM users
+       WHERE access = 'Admin' AND is_active = 1 AND id <> OLD.id) = 0
+BEGIN
+    SELECT RAISE(ABORT, 'this is the last admin; promote someone else before deleting this user');
+END;
+"#;
+
+const MIGRATION_5_DDL: &str = r#"
+-- ---------------------------------------------------------------------------
+-- Quotes and orders: the paperwork that comes before an invoice.
+--
+-- Neither table has a journal entry, because neither has moved money yet. They
+-- exist so a quote can be sent, accepted, and then billed without retyping it.
+-- The moment a document is turned into the next one, its lines freeze; a wrong
+-- quote is replaced by a new quote, never edited under a document that already
+-- relies on it.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE sales_orders (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_no       TEXT    NOT NULL UNIQUE CHECK (length(trim(order_no)) > 0),
+    customer_id    INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+    order_date     TEXT    NOT NULL CHECK (order_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+    requested_date TEXT    CHECK (requested_date IS NULL OR requested_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+    status         TEXT    NOT NULL DEFAULT 'Draft'
+                           CHECK (status IN ('Draft', 'Confirmed', 'Fulfilled', 'Cancelled')),
+    tax_bp         INTEGER NOT NULL DEFAULT 0 CHECK (tax_bp BETWEEN 0 AND 10000),
+    notes          TEXT    NOT NULL DEFAULT '',
+    invoice_id     INTEGER REFERENCES invoices(id) ON DELETE SET NULL,
+    converted_at   TEXT,
+    created_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX idx_sales_orders_customer ON sales_orders(customer_id);
+CREATE INDEX idx_sales_orders_status   ON sales_orders(status);
+
+CREATE TABLE sales_order_lines (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id          INTEGER NOT NULL REFERENCES sales_orders(id) ON DELETE CASCADE,
+    position          INTEGER NOT NULL CHECK (position > 0),
+    description       TEXT    NOT NULL DEFAULT '',
+    qty_hundredths    INTEGER NOT NULL DEFAULT 100 CHECK (qty_hundredths > 0),
+    unit_price_cents  INTEGER NOT NULL DEFAULT 0 CHECK (unit_price_cents >= 0),
+    inventory_item_id INTEGER REFERENCES inventory_items(id) ON DELETE SET NULL,
+    UNIQUE (order_id, position)
+);
+
+CREATE TABLE estimates (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    estimate_no         TEXT    NOT NULL UNIQUE CHECK (length(trim(estimate_no)) > 0),
+    customer_id         INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+    estimate_date       TEXT    NOT NULL CHECK (estimate_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+    expiry_date         TEXT    CHECK (expiry_date IS NULL OR expiry_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+    status              TEXT    NOT NULL DEFAULT 'Draft'
+                                CHECK (status IN ('Draft', 'Sent', 'Accepted', 'Declined', 'Expired')),
+    tax_bp              INTEGER NOT NULL DEFAULT 0 CHECK (tax_bp BETWEEN 0 AND 10000),
+    notes               TEXT    NOT NULL DEFAULT '',
+    converted_order_id   INTEGER REFERENCES sales_orders(id) ON DELETE SET NULL,
+    converted_invoice_id INTEGER REFERENCES invoices(id) ON DELETE SET NULL,
+    converted_at        TEXT,
+    created_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX idx_estimates_customer ON estimates(customer_id);
+CREATE INDEX idx_estimates_status   ON estimates(status);
+
+CREATE TABLE estimate_lines (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    estimate_id       INTEGER NOT NULL REFERENCES estimates(id) ON DELETE CASCADE,
+    position          INTEGER NOT NULL CHECK (position > 0),
+    description       TEXT    NOT NULL DEFAULT '',
+    qty_hundredths    INTEGER NOT NULL DEFAULT 100 CHECK (qty_hundredths > 0),
+    unit_price_cents  INTEGER NOT NULL DEFAULT 0 CHECK (unit_price_cents >= 0),
+    inventory_item_id INTEGER REFERENCES inventory_items(id) ON DELETE SET NULL,
+    UNIQUE (estimate_id, position)
+);
+
+-- A converted estimate is history. Its lines cannot move again, because a
+-- sales order or an invoice was built from exactly what they said.
+CREATE TRIGGER trg_estimate_lines_ins
+BEFORE INSERT ON estimate_lines
+WHEN (SELECT converted_at FROM estimates WHERE id = NEW.estimate_id) IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'a converted estimate cannot be changed; start a new estimate');
+END;
+
+CREATE TRIGGER trg_estimate_lines_upd
+BEFORE UPDATE ON estimate_lines
+WHEN (SELECT converted_at FROM estimates WHERE id = NEW.estimate_id) IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'a converted estimate cannot be changed; start a new estimate');
+END;
+
+CREATE TRIGGER trg_estimate_lines_del
+BEFORE DELETE ON estimate_lines
+WHEN (SELECT converted_at FROM estimates WHERE id = OLD.estimate_id) IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'a converted estimate cannot be changed; start a new estimate');
+END;
+
+CREATE TRIGGER trg_sales_order_lines_ins
+BEFORE INSERT ON sales_order_lines
+WHEN (SELECT invoice_id FROM sales_orders WHERE id = NEW.order_id) IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'an invoiced sales order cannot be changed; start a new order');
+END;
+
+CREATE TRIGGER trg_sales_order_lines_upd
+BEFORE UPDATE ON sales_order_lines
+WHEN (SELECT invoice_id FROM sales_orders WHERE id = NEW.order_id) IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'an invoiced sales order cannot be changed; start a new order');
+END;
+
+CREATE TRIGGER trg_sales_order_lines_del
+BEFORE DELETE ON sales_order_lines
+WHEN (SELECT invoice_id FROM sales_orders WHERE id = OLD.order_id) IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'an invoiced sales order cannot be changed; start a new order');
+END;
+
+CREATE TRIGGER trg_estimates_no_delete_converted
+BEFORE DELETE ON estimates
+WHEN OLD.converted_at IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'this estimate has already become an order or an invoice, so it stays on file');
+END;
+
+CREATE TRIGGER trg_sales_orders_no_delete_invoiced
+BEFORE DELETE ON sales_orders
+WHEN OLD.invoice_id IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'this order has already been invoiced, so it stays on file');
+END;
+
+-- An invoice number is how a customer refers to a bill, so quotes and orders
+-- get their own series rather than borrowing it.
+INSERT INTO settings (key, value) VALUES ('estimate_series', 'EST');
+INSERT INTO settings (key, value) VALUES ('sales_order_series', 'SO');
+
+-- Payroll facts that change withholding. Single and married are taxed at
+-- different rates, and each withholding allowance takes a slice of pay out of
+-- the federal calculation before the rate is applied.
+ALTER TABLE payroll_runs ADD COLUMN marital_status TEXT NOT NULL DEFAULT 'Single'
+    CHECK (marital_status IN ('Single', 'Married'));
+ALTER TABLE payroll_runs ADD COLUMN allowances INTEGER NOT NULL DEFAULT 0
+    CHECK (allowances >= 0);
+
+INSERT INTO settings (key, value) VALUES ('payroll_federal_single_bp', '1200');
+INSERT INTO settings (key, value) VALUES ('payroll_federal_married_bp', '800');
+INSERT INTO settings (key, value) VALUES ('payroll_state_bp', '400');
+INSERT INTO settings (key, value) VALUES ('payroll_allowance_cents', '19400');
+"#;
+
+// ---------------------------------------------------------------------------
+// Schema v6 — employees and additions
+// ---------------------------------------------------------------------------
+
+const MIGRATION_6_DDL: &str = r#"
+-- ---------------------------------------------------------------------------
+-- Employees are people you pay. They are not users: most crews never open the
+-- company file. W-2 details say who they are, W-4 details say how to withhold,
+-- and a user link is optional — only needed when someone also logs time.
+-- ---------------------------------------------------------------------------
+CREATE TABLE employees (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                      TEXT    NOT NULL CHECK (length(trim(name)) > 0),
+    employee_no               TEXT    NOT NULL DEFAULT '',
+    email                     TEXT    NOT NULL DEFAULT '',
+    phone                     TEXT    NOT NULL DEFAULT '',
+    address                   TEXT    NOT NULL DEFAULT '',
+    -- Only the last four digits are kept, so the file never holds a full SSN.
+    ssn_last4                 TEXT    NOT NULL DEFAULT ''
+                                      CHECK (ssn_last4 = '' OR ssn_last4 GLOB '[0-9][0-9][0-9][0-9]'),
+    hire_date                 TEXT    CHECK (hire_date IS NULL
+                                             OR hire_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+    job_title                 TEXT    NOT NULL DEFAULT '',
+    user_id                   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    filing_status             TEXT    NOT NULL DEFAULT 'Single'
+                                      CHECK (filing_status IN ('Single', 'Married')),
+    allowances                INTEGER NOT NULL DEFAULT 0 CHECK (allowances >= 0),
+    extra_withholding_cents   INTEGER NOT NULL DEFAULT 0 CHECK (extra_withholding_cents >= 0),
+    pay_rate_cents            INTEGER NOT NULL DEFAULT 0 CHECK (pay_rate_cents >= 0),
+    allowance_cents           INTEGER NOT NULL DEFAULT 0 CHECK (allowance_cents >= 0),
+    mileage_reimbursement     INTEGER NOT NULL DEFAULT 0 CHECK (mileage_reimbursement IN (0, 1)),
+    is_active                 INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+    created_at                TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE UNIQUE INDEX idx_employees_name ON employees(lower(name));
+CREATE INDEX idx_employees_user ON employees(user_id);
+
+-- Additions ride on top of net pay. They are not wages: no income tax and no
+-- Social Security or Medicare is taken from a reimbursement, which is why they
+-- live in their own columns instead of being folded into gross.
+ALTER TABLE payroll_runs ADD COLUMN employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL;
+ALTER TABLE payroll_runs ADD COLUMN extra_withholding_cents INTEGER NOT NULL DEFAULT 0
+    CHECK (extra_withholding_cents >= 0);
+ALTER TABLE payroll_runs ADD COLUMN mileage_hundredths INTEGER NOT NULL DEFAULT 0
+    CHECK (mileage_hundredths >= 0);
+ALTER TABLE payroll_runs ADD COLUMN mileage_cents INTEGER NOT NULL DEFAULT 0
+    CHECK (mileage_cents >= 0);
+ALTER TABLE payroll_runs ADD COLUMN allowance_cents INTEGER NOT NULL DEFAULT 0
+    CHECK (allowance_cents >= 0);
+ALTER TABLE payroll_runs ADD COLUMN additions_cents INTEGER NOT NULL DEFAULT 0
+    CHECK (additions_cents >= 0);
+
+-- A mile is paid once. The pay run that reimbursed it is recorded here, so the
+-- next run only offers the miles still outstanding.
+ALTER TABLE time_entries ADD COLUMN reimbursed_run_id INTEGER
+    REFERENCES payroll_runs(id) ON DELETE SET NULL;
+
+CREATE INDEX idx_time_entries_reimbursed ON time_entries(reimbursed_run_id);
+
+-- The rates that change over time are settings, not constants in the engine.
+INSERT INTO settings (key, value) VALUES ('payroll_social_security_bp', '620');
+INSERT INTO settings (key, value) VALUES ('payroll_medicare_bp', '145');
+INSERT INTO settings (key, value) VALUES ('payroll_mileage_rate_cents', '67');
+
+-- An employee with pay runs on file is history. The pay runs keep the name
+-- they were paid under, so the record is retired rather than deleted.
+CREATE TRIGGER trg_employees_no_delete_with_payroll
+BEFORE DELETE ON employees
+WHEN EXISTS (SELECT 1 FROM payroll_runs WHERE employee_id = OLD.id)
+BEGIN
+    SELECT RAISE(ABORT, 'this employee has pay runs on file; mark them inactive instead of deleting them');
+END;
+"#;
+
+// ---------------------------------------------------------------------------
+// Schema v7 — pay basis, and the whole Social Security number
+// ---------------------------------------------------------------------------
+
+const MIGRATION_7_DDL: &str = r#"
+-- ---------------------------------------------------------------------------
+-- Not everybody is paid by the hour. A salary is a yearly figure split into
+-- equal payments, so the employee record has to say both how the money is
+-- quoted and how often it is paid out.
+-- ---------------------------------------------------------------------------
+ALTER TABLE employees ADD COLUMN pay_type TEXT NOT NULL DEFAULT 'Hourly'
+    CHECK (pay_type IN ('Hourly', 'Salary'));
+
+ALTER TABLE employees ADD COLUMN pay_frequency TEXT NOT NULL DEFAULT 'BiWeekly'
+    CHECK (pay_frequency IN ('Weekly', 'BiWeekly', 'SemiMonthly', 'Monthly'));
+
+-- Only used when the employee is salaried: the yearly figure the period pay is
+-- worked out from. An hourly employee's rate stays in pay_rate_cents.
+ALTER TABLE employees ADD COLUMN salary_cents INTEGER NOT NULL DEFAULT 0
+    CHECK (salary_cents >= 0);
+
+-- A W-2 has a box 2 wage total and box a Social Security number, so the file
+-- has to hold the whole number, not a hint of it. A company file is a private
+-- document: keep it on a protected drive, and hand out backups the way you
+-- would hand out payroll paperwork.
+ALTER TABLE employees ADD COLUMN ssn TEXT NOT NULL DEFAULT ''
+    CHECK (ssn = '' OR ssn GLOB '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]');
+
+-- A pay run records the basis it was paid on, so a later raise or a change of
+-- pay frequency never rewrites what an old check was worked out from.
+ALTER TABLE payroll_runs ADD COLUMN pay_type TEXT NOT NULL DEFAULT 'Hourly'
+    CHECK (pay_type IN ('Hourly', 'Salary'));
+
+ALTER TABLE payroll_runs ADD COLUMN pay_frequency TEXT NOT NULL DEFAULT 'BiWeekly'
+    CHECK (pay_frequency IN ('Weekly', 'BiWeekly', 'SemiMonthly', 'Monthly'));
+
+ALTER TABLE payroll_runs ADD COLUMN salary_cents INTEGER NOT NULL DEFAULT 0
+    CHECK (salary_cents >= 0);
+"#;
+
+// ---------------------------------------------------------------------------
+// Schema v8 — payroll as an access level of its own
+// ---------------------------------------------------------------------------
+
+const MIGRATION_8_DDL: &str = r#"
+-- ---------------------------------------------------------------------------
+-- A payroll person is neither a full bookkeeper nor a limited one: they run pay
+-- and keep the roster, and the wages and Social Security numbers stay out of
+-- everyone else's reach. SQLite cannot change a CHECK in place, so the table is
+-- rebuilt with the same rows and one wider rule.
+--
+-- Foreign keys are switched off for the rebuild: time entries point at users
+-- with ON DELETE SET NULL, and dropping the old table with them on would quietly
+-- blank the owner of every hour and mile on the way past. No row is deleted —
+-- the same ids are copied — so the file is left with no violations.
+-- ---------------------------------------------------------------------------
+PRAGMA foreign_keys = OFF;
+
+CREATE TABLE users_v8 (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT    NOT NULL CHECK (length(trim(name)) > 0),
+    email      TEXT    NOT NULL DEFAULT '',
+    access     TEXT    NOT NULL DEFAULT 'Standard'
+                       CHECK (access IN ('Admin', 'Standard', 'Payroll', 'TimeEntry', 'ReadOnly')),
+    is_active  INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+    created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+INSERT INTO users_v8 (id, name, email, access, is_active, created_at)
+SELECT id, name, email, access, is_active, created_at FROM users;
+
+DROP TABLE users;
+ALTER TABLE users_v8 RENAME TO users;
+CREATE UNIQUE INDEX idx_users_name ON users(lower(name));
+
+-- Dropping the old table dropped its triggers with it, and the rules they
+-- carried are the ones worth keeping: a file always has an admin.
+CREATE TRIGGER trg_users_keep_an_admin_upd
+BEFORE UPDATE OF access, is_active ON users
+WHEN OLD.access = 'Admin'
+ AND OLD.is_active = 1
+ AND (NEW.access <> 'Admin' OR NEW.is_active <> 1)
+ AND (SELECT COUNT(*) FROM users
+       WHERE access = 'Admin' AND is_active = 1 AND id <> OLD.id) = 0
+BEGIN
+    SELECT RAISE(ABORT, 'this is the last admin; promote someone else before changing this user');
+END;
+
+CREATE TRIGGER trg_users_keep_an_admin_del
+BEFORE DELETE ON users
+WHEN OLD.access = 'Admin'
+ AND OLD.is_active = 1
+ AND (SELECT COUNT(*) FROM users
+       WHERE access = 'Admin' AND is_active = 1 AND id <> OLD.id) = 0
+BEGIN
+    SELECT RAISE(ABORT, 'this is the last admin; promote someone else before deleting this user');
+END;
+
+PRAGMA foreign_keys = ON;
 "#;

@@ -68,7 +68,7 @@ fn new_company_is_seeded_and_audited() {
 
     assert_eq!(fixture.company.name, "Acme Widgets");
     assert_eq!(fixture.company.base_currency, "USD");
-    assert_eq!(fixture.company.schema_version, 3);
+    assert_eq!(fixture.company.schema_version, 8);
 
     let chart = accounts::list(&conn).unwrap();
     assert_eq!(chart.len(), accounts::DEFAULT_CHART.len());

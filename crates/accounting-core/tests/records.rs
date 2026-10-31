@@ -419,23 +419,32 @@ fn a_pay_run_splits_gross_pay_between_the_bank_and_liabilities() {
         &mut conn,
         &PayrollInput {
             id: None,
+            employee_id: None,
             employee: "J. Alvarez".into(),
             pay_date: "2026-08-15".into(),
             check_number: "1042".into(),
             pay_rate_cents: 4_000,
+            pay_type: "Hourly".into(),
+            pay_frequency: "BiWeekly".into(),
+            salary_cents: 0,
             regular_hours_hundredths: 8_000,
             overtime_hours_hundredths: 500,
-            federal_cents: 42_000,
-            state_cents: 14_000,
-            social_security_cents: 21_700,
-            medicare_cents: 5_100,
+            marital_status: "Single".into(),
+            allowances: 0,
+            extra_withholding_cents: 0,
             other_deductions_cents: 0,
+            pay_mileage: false,
+            pay_allowance: false,
+            allowance_cents: 0,
         },
     )
     .unwrap();
 
     assert_eq!(run.gross_cents, 350_000, "80h at 40.00 plus 5h at 60.00");
-    assert_eq!(run.net_cents, 350_000 - 82_800);
+    assert_eq!(run.federal_cents, 42_000, "single, no allowances: 12% of gross");
+    assert_eq!(run.social_security_cents, 21_700);
+    assert_eq!(run.medicare_cents, 5_075);
+    assert_eq!(run.net_cents, 350_000 - 82_775);
 
     let dash = simple::dashboard(&conn).unwrap();
     assert_eq!(

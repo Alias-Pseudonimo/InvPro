@@ -26,13 +26,17 @@
 pub mod accounts;
 pub mod audit;
 pub mod company;
+pub mod credits;
 pub mod dates;
 pub mod db;
+pub mod employees;
 pub mod error;
 pub mod journal;
 pub mod money;
+pub mod pipeline;
 pub mod reports;
 pub mod simple;
+pub mod users;
 
 pub(crate) mod schema;
 
