@@ -1,0 +1,15 @@
+[package]
+name = "accounting-core"
+version = "0.1.0"
+edition = "2021"
+description = "Double-entry bookkeeping engine for the LedgerWorks desktop ledger"
+license = "MIT"
+
+[dependencies]
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

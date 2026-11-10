@@ -1,0 +1,954 @@
+//! Tauri command surface. The shell owns exactly one open company file and
+//! forwards each call into `accounting-core`; no bookkeeping rule lives here.
+
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+use accounting_core::accounts::{self, Account, AccountInput};
+use accounting_core::audit::{self, AuditRow, ChainReport};
+use accounting_core::company::{self, CompanySummary};
+use accounting_core::credits::{self, CreditMemo, CreditMemoInput};
+use accounting_core::employees::{self, Employee, EmployeeInput, MileageDue};
+use accounting_core::journal::{self, EntryDetail, EntrySummary, JournalEntryInput};
+use accounting_core::pipeline::{self, Estimate, EstimateInput, SalesOrder, SalesOrderInput};
+use accounting_core::reports::{self, TrialBalanceReport};
+use accounting_core::users::{self, Capability, Person, TimeEntry, TimeEntryInput, User, UserInput};
+use accounting_core::simple::{
+    self, BalanceSheet, Customer, Dashboard, ExpenseInput, ExpenseRecord, IncomeInput,
+    IncomeRecord, InventoryInput, InventoryItem, Invoice, InvoiceInput, PartyInput, PayrollInput,
+    PayrollRun, ProfitAndLoss, Purchase, PurchaseInput, RecurringInvoice, RecurringInvoiceInput,
+    Setting, TaxSummary, Vendor,
+};
+use accounting_core::{db, CoreError};
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+use tauri::State;
+
+struct Session {
+    path: PathBuf,
+    conn: Connection,
+}
+
+pub struct AppState {
+    session: Mutex<Option<Session>>,
+    companies_directory: PathBuf,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            session: Mutex::new(None),
+            companies_directory: company::default_directory(),
+        }
+    }
+}
+
+fn error_text(err: CoreError) -> String {
+    err.to_string()
+}
+
+fn access_label(access: &str) -> &'static str {
+    match access {
+        users::ACCESS_ADMIN => "admin",
+        users::ACCESS_STANDARD => "standard",
+        users::ACCESS_PAYROLL => "payroll",
+        users::ACCESS_TIME => "time entry",
+        users::ACCESS_READ_ONLY => "read only",
+        _ => "limited",
+    }
+}
+
+/// Every command states what it needs. The acting user's access level decides
+/// it here, in one place, so a screen can never widen its own permissions.
+fn with_session<T>(
+    state: &AppState,
+    capability: Capability,
+    action: impl FnOnce(&mut Connection) -> accounting_core::Result<T>,
+) -> Result<T, String> {
+    let mut guard = state
+        .session
+        .lock()
+        .map_err(|_| "the company session is unavailable".to_string())?;
+    let session = guard
+        .as_mut()
+        .ok_or_else(|| "no company file is open".to_string())?;
+    let user = users::current_user(&session.conn).map_err(error_text)?;
+    if !users::allows(&user.access, capability) {
+        return Err(format!(
+            "{} has {} access, so they cannot {}. An admin can change this in Settings, under Users and access.",
+            user.name,
+            access_label(&user.access),
+            capability.refused()
+        ));
+    }
+    action(&mut session.conn).map_err(error_text)
+}
+
+/// A session without an access check. Only for the two things that establish
+/// and report who is acting — every book command goes through `with_session`.
+fn with_any_session<T>(
+    state: &AppState,
+    action: impl FnOnce(&mut Connection) -> accounting_core::Result<T>,
+) -> Result<T, String> {
+    let mut guard = state
+        .session
+        .lock()
+        .map_err(|_| "the company session is unavailable".to_string())?;
+    let session = guard
+        .as_mut()
+        .ok_or_else(|| "no company file is open".to_string())?;
+    action(&mut session.conn).map_err(error_text)
+}
+
+fn summarize(session: &Session) -> Result<CompanySummary, String> {
+    company::describe(&session.path).map_err(error_text)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCompanyInput {
+    pub name: String,
+    #[serde(default)]
+    pub base_currency: Option<String>,
+    #[serde(default)]
+    pub fiscal_year_start_month: Option<u8>,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCompanyInput {
+    pub path: String,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+fn resolve_actor(requested: Option<String>) -> String {
+    requested
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var("USERNAME").ok())
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "local user".to_string())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LedgerHealth {
+    pub schema_version: i32,
+    pub integrity: String,
+    pub balanced: bool,
+    pub account_count: i64,
+    pub entry_count: i64,
+}
+
+#[tauri::command]
+fn list_companies(state: State<'_, AppState>) -> Result<Vec<CompanySummary>, String> {
+    company::list(&state.companies_directory).map_err(error_text)
+}
+
+#[tauri::command]
+fn companies_directory(state: State<'_, AppState>) -> String {
+    state.companies_directory.to_string_lossy().to_string()
+}
+
+#[tauri::command]
+fn create_company(
+    state: State<'_, AppState>,
+    input: CreateCompanyInput,
+) -> Result<CompanySummary, String> {
+    let created = company::create(
+        &state.companies_directory,
+        &input.name,
+        input.base_currency.as_deref().unwrap_or("USD"),
+        input.fiscal_year_start_month.unwrap_or(1),
+    )
+    .map_err(error_text)?;
+
+    let conn = db::open(std::path::Path::new(&created.path)).map_err(error_text)?;
+    let actor = users::current_user(&conn)
+        .map(|user| user.name)
+        .unwrap_or_else(|_| resolve_actor(input.actor.clone()));
+    db::set_actor(&conn, &actor).map_err(error_text)?;
+
+    let mut guard = state
+        .session
+        .lock()
+        .map_err(|_| "the company session is unavailable".to_string())?;
+    *guard = Some(Session {
+        path: PathBuf::from(&created.path),
+        conn,
+    });
+    drop(guard);
+    Ok(created)
+}
+
+#[tauri::command]
+fn open_company(
+    state: State<'_, AppState>,
+    input: OpenCompanyInput,
+) -> Result<CompanySummary, String> {
+    let path = PathBuf::from(&input.path);
+    let summary = company::describe(&path).map_err(error_text)?;
+    let conn = db::open(&path).map_err(error_text)?;
+    let actor = users::current_user(&conn)
+        .map(|user| user.name)
+        .unwrap_or_else(|_| resolve_actor(input.actor.clone()));
+    db::set_actor(&conn, &actor).map_err(error_text)?;
+
+    let mut guard = state
+        .session
+        .lock()
+        .map_err(|_| "the company session is unavailable".to_string())?;
+    *guard = Some(Session { path, conn });
+    drop(guard);
+    Ok(summary)
+}
+
+#[tauri::command]
+fn close_company(state: State<'_, AppState>) -> Result<(), String> {
+    let mut guard = state
+        .session
+        .lock()
+        .map_err(|_| "the company session is unavailable".to_string())?;
+    *guard = None;
+    Ok(())
+}
+
+#[tauri::command]
+fn current_company(state: State<'_, AppState>) -> Result<Option<CompanySummary>, String> {
+    let guard = state
+        .session
+        .lock()
+        .map_err(|_| "the company session is unavailable".to_string())?;
+    match guard.as_ref() {
+        Some(session) => summarize(session).map(Some),
+        None => Ok(None),
+    }
+}
+
+#[tauri::command]
+fn list_accounts(state: State<'_, AppState>) -> Result<Vec<Account>, String> {
+    with_session(&state, Capability::ViewBooks, |conn| accounts::list(conn))
+}
+
+#[tauri::command]
+fn create_account(state: State<'_, AppState>, input: AccountInput) -> Result<Account, String> {
+    with_session(&state, Capability::EditRecords, |conn| accounts::create(conn, &input))
+}
+
+#[tauri::command]
+fn set_account_active(state: State<'_, AppState>, account_id: i64, active: bool) -> Result<(), String> {
+    with_session(&state, Capability::EditRecords, |conn| accounts::set_active(conn, account_id, active))
+}
+
+#[tauri::command]
+fn list_journal_entries(
+    state: State<'_, AppState>,
+    limit: Option<i64>,
+) -> Result<Vec<EntrySummary>, String> {
+    with_session(&state, Capability::ViewBooks, |conn| journal::list(conn, limit.unwrap_or(100)))
+}
+
+#[tauri::command]
+fn post_journal_entry(
+    state: State<'_, AppState>,
+    input: JournalEntryInput,
+) -> Result<EntryDetail, String> {
+    with_session(&state, Capability::EditRecords, |conn| journal::post(conn, &input))
+}
+
+#[tauri::command]
+fn void_journal_entry(state: State<'_, AppState>, entry_id: i64) -> Result<(), String> {
+    with_session(&state, Capability::EditRecords, |conn| journal::void_entry(conn, entry_id))
+}
+
+#[tauri::command]
+fn trial_balance(state: State<'_, AppState>) -> Result<TrialBalanceReport, String> {
+    with_session(&state, Capability::ViewBooks, |conn| reports::trial_balance(conn))
+}
+
+#[tauri::command]
+fn verify_audit_chain(state: State<'_, AppState>) -> Result<ChainReport, String> {
+    with_session(&state, Capability::ViewBooks, |conn| audit::verify(conn))
+}
+
+#[tauri::command]
+fn list_audit_log(state: State<'_, AppState>, limit: Option<i64>) -> Result<Vec<AuditRow>, String> {
+    with_session(&state, Capability::ViewBooks, |conn| audit::list(conn, limit.unwrap_or(200)))
+}
+
+#[tauri::command]
+fn ledger_health(state: State<'_, AppState>) -> Result<LedgerHealth, String> {
+    with_session(&state, Capability::ViewBooks, |conn| {
+        let account_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))?;
+        let entry_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM journal_entries", [], |row| row.get(0))?;
+        Ok(LedgerHealth {
+            schema_version: db::schema_version(conn)?,
+            integrity: db::integrity_check(conn)?,
+            balanced: reports::ledger_is_balanced(conn)?,
+            account_count,
+            entry_count,
+        })
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Plain-language records. Each of these is a single call from the UI; the
+// posting rules behind them live in `accounting_core::simple`.
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn list_customers(state: State<'_, AppState>) -> Result<Vec<Customer>, String> {
+    with_session(&state, Capability::ViewBooks, |conn| simple::list_customers(conn))
+}
+
+#[tauri::command]
+fn save_customer(state: State<'_, AppState>, input: PartyInput) -> Result<Customer, String> {
+    with_session(&state, Capability::EditRecords, |conn| simple::save_customer(conn, &input))
+}
+
+#[tauri::command]
+fn delete_customer(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    with_session(&state, Capability::EditRecords, |conn| simple::delete_customer(conn, id))
+}
+
+#[tauri::command]
+fn list_vendors(state: State<'_, AppState>) -> Result<Vec<Vendor>, String> {
+    with_session(&state, Capability::ViewBooks, |conn| simple::list_vendors(conn))
+}
+
+#[tauri::command]
+fn save_vendor(state: State<'_, AppState>, input: PartyInput) -> Result<Vendor, String> {
+    with_session(&state, Capability::EditRecords, |conn| simple::save_vendor(conn, &input))
+}
+
+#[tauri::command]
+fn delete_vendor(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    with_session(&state, Capability::EditRecords, |conn| simple::delete_vendor(conn, id))
+}
+
+#[tauri::command]
+fn list_inventory(state: State<'_, AppState>) -> Result<Vec<InventoryItem>, String> {
+    with_session(&state, Capability::ViewBooks, |conn| simple::list_inventory(conn))
+}
+
+#[tauri::command]
+fn save_inventory_item(
+    state: State<'_, AppState>,
+    input: InventoryInput,
+) -> Result<InventoryItem, String> {
+    with_session(&state, Capability::EditRecords, |conn| simple::save_inventory_item(conn, &input))
+}
+
+#[tauri::command]
+fn delete_inventory_item(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    with_session(&state, Capability::EditRecords, |conn| simple::delete_inventory_item(conn, id))
+}
+
+#[tauri::command]
+fn list_income(state: State<'_, AppState>) -> Result<Vec<IncomeRecord>, String> {
+    with_session(&state, Capability::ViewBooks, |conn| simple::list_income(conn))
+}
+
+#[tauri::command]
+fn save_income(state: State<'_, AppState>, input: IncomeInput) -> Result<IncomeRecord, String> {
+    with_session(&state, Capability::EditRecords, |conn| simple::save_income(conn, &input))
+}
+
+#[tauri::command]
+fn delete_income(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    with_session(&state, Capability::EditRecords, |conn| simple::delete_income(conn, id))
+}
+
+#[tauri::command]
+fn list_expenses(state: State<'_, AppState>) -> Result<Vec<ExpenseRecord>, String> {
+    with_session(&state, Capability::ViewBooks, |conn| simple::list_expenses(conn))
+}
+
+#[tauri::command]
+fn save_expense(state: State<'_, AppState>, input: ExpenseInput) -> Result<ExpenseRecord, String> {
+    with_session(&state, Capability::EditRecords, |conn| simple::save_expense(conn, &input))
+}
+
+#[tauri::command]
+fn delete_expense(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    with_session(&state, Capability::EditRecords, |conn| simple::delete_expense(conn, id))
+}
+
+#[tauri::command]
+fn list_invoices(state: State<'_, AppState>) -> Result<Vec<Invoice>, String> {
+    with_session(&state, Capability::ViewBooks, |conn| simple::list_invoices(conn))
+}
+
+#[tauri::command]
+fn get_invoice(state: State<'_, AppState>, id: i64) -> Result<Invoice, String> {
+    with_session(&state, Capability::ViewBooks, |conn| simple::get_invoice(conn, id))
+}
+
+#[tauri::command]
+fn save_invoice(state: State<'_, AppState>, input: InvoiceInput) -> Result<Invoice, String> {
+    with_session(&state, Capability::EditRecords, |conn| simple::save_invoice(conn, &input))
+}
+
+#[tauri::command]
+fn delete_invoice(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    with_session(&state, Capability::EditRecords, |conn| simple::delete_invoice(conn, id))
+}
+
+#[tauri::command]
+fn list_recurring_invoices(state: State<'_, AppState>) -> Result<Vec<RecurringInvoice>, String> {
+    with_session(&state, Capability::ViewBooks, |conn| simple::list_recurring_invoices(conn))
+}
+
+#[tauri::command]
+fn save_recurring_invoice(
+    state: State<'_, AppState>,
+    input: RecurringInvoiceInput,
+) -> Result<RecurringInvoice, String> {
+    with_session(&state, Capability::EditRecords, |conn| simple::save_recurring_invoice(conn, &input))
+}
+
+#[tauri::command]
+fn delete_recurring_invoice(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    with_session(&state, Capability::EditRecords, |conn| simple::delete_recurring_invoice(conn, id))
+}
+
+#[tauri::command]
+fn generate_due_invoices(
+    state: State<'_, AppState>,
+    today: String,
+) -> Result<Vec<Invoice>, String> {
+    with_session(&state, Capability::EditRecords, |conn| simple::generate_due_invoices(conn, &today))
+}
+
+#[tauri::command]
+fn list_purchases(state: State<'_, AppState>) -> Result<Vec<Purchase>, String> {
+    with_session(&state, Capability::ViewBooks, |conn| simple::list_purchases(conn))
+}
+
+#[tauri::command]
+fn save_purchase(state: State<'_, AppState>, input: PurchaseInput) -> Result<Purchase, String> {
+    with_session(&state, Capability::EditRecords, |conn| simple::save_purchase(conn, &input))
+}
+
+#[tauri::command]
+fn delete_purchase(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    with_session(&state, Capability::EditRecords, |conn| simple::delete_purchase(conn, id))
+}
+
+#[tauri::command]
+fn list_payroll(state: State<'_, AppState>) -> Result<Vec<PayrollRun>, String> {
+    with_session(&state, Capability::ManagePayroll, |conn| simple::list_payroll(conn))
+}
+
+/// What the pay run would look like, without writing it. The composer shows
+/// exactly what the engine will save, so the figure cannot drift.
+#[tauri::command]
+fn preview_payroll(state: State<'_, AppState>, input: PayrollInput) -> Result<PayrollRun, String> {
+    with_session(&state, Capability::ManagePayroll, |conn| {
+        simple::preview_payroll(conn, &input)
+    })
+}
+
+#[tauri::command]
+fn save_payroll(state: State<'_, AppState>, input: PayrollInput) -> Result<PayrollRun, String> {
+    with_session(&state, Capability::ManagePayroll, |conn| {
+        simple::save_payroll(conn, &input)
+    })
+}
+
+#[tauri::command]
+fn delete_payroll(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    with_session(&state, Capability::ManagePayroll, |conn| simple::delete_payroll(conn, id))
+}
+
+// ---------------------------------------------------------------------------
+// Employees. Payroll data, not sign-in data: these people need no account.
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn list_employees(state: State<'_, AppState>) -> Result<Vec<Employee>, String> {
+    with_session(&state, Capability::ManagePayroll, |conn| employees::list(conn))
+}
+
+#[tauri::command]
+fn save_employee(state: State<'_, AppState>, input: EmployeeInput) -> Result<Employee, String> {
+    with_session(&state, Capability::ManagePayroll, |conn| {
+        employees::save(conn, &input)
+    })
+}
+
+#[tauri::command]
+fn delete_employee(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    with_session(&state, Capability::ManagePayroll, |conn| {
+        employees::delete(conn, id)
+    })
+}
+
+/// The miles a pay run could reimburse for this employee, and what they are
+/// worth at the rate in Settings.
+#[tauri::command]
+fn mileage_due(
+    state: State<'_, AppState>,
+    employee_id: Option<i64>,
+) -> Result<MileageDue, String> {
+    with_session(&state, Capability::ManagePayroll, |conn| {
+        let record = employees::find_by_id(conn, employee_id)?;
+        employees::mileage_due(conn, record.as_ref(), None)
+    })
+}
+
+#[tauri::command]
+fn dashboard(state: State<'_, AppState>) -> Result<Dashboard, String> {
+    with_session(&state, Capability::ViewBooks, |conn| simple::dashboard(conn))
+}
+
+#[tauri::command]
+fn profit_and_loss(
+    state: State<'_, AppState>,
+    from: Option<String>,
+    to: Option<String>,
+) -> Result<ProfitAndLoss, String> {
+    with_session(&state, Capability::ViewBooks, |conn| {
+        simple::profit_and_loss(conn, from.as_deref(), to.as_deref())
+    })
+}
+
+#[tauri::command]
+fn balance_sheet(
+    state: State<'_, AppState>,
+    as_of: Option<String>,
+) -> Result<BalanceSheet, String> {
+    with_session(&state, Capability::ViewBooks, |conn| simple::balance_sheet(conn, as_of.as_deref()))
+}
+
+#[tauri::command]
+fn tax_summary(
+    state: State<'_, AppState>,
+    from: Option<String>,
+    to: Option<String>,
+) -> Result<TaxSummary, String> {
+    with_session(&state, Capability::ViewBooks, |conn| {
+        simple::tax_summary(conn, from.as_deref(), to.as_deref())
+    })
+}
+
+#[tauri::command]
+fn list_settings(state: State<'_, AppState>) -> Result<Vec<Setting>, String> {
+    with_session(&state, Capability::ViewBooks, |conn| simple::settings(conn))
+}
+
+#[tauri::command]
+fn save_setting(state: State<'_, AppState>, key: String, value: String) -> Result<(), String> {
+    with_session(&state, Capability::ManageSettings, |conn| simple::put_setting(conn, &key, &value))
+}
+
+// ---------------------------------------------------------------------------
+// Credit memos
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn list_credit_memos(state: State<'_, AppState>) -> Result<Vec<CreditMemo>, String> {
+    with_session(&state, Capability::ViewBooks, |conn| {
+        credits::list_credit_memos(conn)
+    })
+}
+
+#[tauri::command]
+fn get_credit_memo(state: State<'_, AppState>, id: i64) -> Result<CreditMemo, String> {
+    with_session(&state, Capability::ViewBooks, |conn| {
+        credits::memo_by_id(conn, id)
+    })
+}
+
+#[tauri::command]
+fn save_credit_memo(
+    state: State<'_, AppState>,
+    input: CreditMemoInput,
+) -> Result<CreditMemo, String> {
+    with_session(&state, Capability::EditRecords, |conn| {
+        credits::save_credit_memo(conn, &input)
+    })
+}
+
+#[tauri::command]
+fn delete_credit_memo(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    with_session(&state, Capability::EditRecords, |conn| {
+        credits::delete_credit_memo(conn, id)
+    })
+}
+
+#[tauri::command]
+fn void_credit_memo(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    with_session(&state, Capability::EditRecords, |conn| {
+        credits::void_credit_memo(conn, id)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Estimates and sales orders — the paperwork before an invoice
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn list_estimates(state: State<'_, AppState>) -> Result<Vec<Estimate>, String> {
+    with_session(&state, Capability::ViewBooks, |conn| pipeline::list_estimates(conn))
+}
+
+#[tauri::command]
+fn get_estimate(state: State<'_, AppState>, id: i64) -> Result<Estimate, String> {
+    with_session(&state, Capability::ViewBooks, |conn| {
+        pipeline::estimate_by_id(conn, id)
+    })
+}
+
+#[tauri::command]
+fn save_estimate(state: State<'_, AppState>, input: EstimateInput) -> Result<Estimate, String> {
+    with_session(&state, Capability::EditRecords, |conn| {
+        pipeline::save_estimate(conn, &input)
+    })
+}
+
+#[tauri::command]
+fn delete_estimate(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    with_session(&state, Capability::EditRecords, |conn| {
+        pipeline::delete_estimate(conn, id)
+    })
+}
+
+#[tauri::command]
+fn convert_estimate_to_order(
+    state: State<'_, AppState>,
+    id: i64,
+    order_date: Option<String>,
+) -> Result<SalesOrder, String> {
+    with_session(&state, Capability::EditRecords, |conn| {
+        pipeline::convert_estimate_to_order(conn, id, order_date.as_deref())
+    })
+}
+
+#[tauri::command]
+fn convert_estimate_to_invoice(
+    state: State<'_, AppState>,
+    id: i64,
+    invoice_date: Option<String>,
+) -> Result<Invoice, String> {
+    with_session(&state, Capability::EditRecords, |conn| {
+        pipeline::convert_estimate_to_invoice(conn, id, invoice_date.as_deref())
+    })
+}
+
+#[tauri::command]
+fn list_sales_orders(state: State<'_, AppState>) -> Result<Vec<SalesOrder>, String> {
+    with_session(&state, Capability::ViewBooks, |conn| {
+        pipeline::list_sales_orders(conn)
+    })
+}
+
+#[tauri::command]
+fn get_sales_order(state: State<'_, AppState>, id: i64) -> Result<SalesOrder, String> {
+    with_session(&state, Capability::ViewBooks, |conn| {
+        pipeline::sales_order_by_id(conn, id)
+    })
+}
+
+#[tauri::command]
+fn save_sales_order(
+    state: State<'_, AppState>,
+    input: SalesOrderInput,
+) -> Result<SalesOrder, String> {
+    with_session(&state, Capability::EditRecords, |conn| {
+        pipeline::save_sales_order(conn, &input)
+    })
+}
+
+#[tauri::command]
+fn delete_sales_order(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    with_session(&state, Capability::EditRecords, |conn| {
+        pipeline::delete_sales_order(conn, id)
+    })
+}
+
+#[tauri::command]
+fn convert_sales_order_to_invoice(
+    state: State<'_, AppState>,
+    id: i64,
+    invoice_date: Option<String>,
+) -> Result<Invoice, String> {
+    with_session(&state, Capability::EditRecords, |conn| {
+        pipeline::convert_order_to_invoice(conn, id, invoice_date.as_deref())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// People, their access level, and their time
+// ---------------------------------------------------------------------------
+
+/// Who the app is acting as. Reading your own identity is always allowed, even
+/// for someone whose access level cannot open the books.
+#[tauri::command]
+fn current_user(state: State<'_, AppState>) -> Result<User, String> {
+    with_any_session(&state, |conn| users::current_user(conn))
+}
+
+#[tauri::command]
+fn switch_user(state: State<'_, AppState>, id: i64) -> Result<User, String> {
+    with_any_session(&state, |conn| users::set_current_user(conn, id))
+}
+
+#[tauri::command]
+fn list_people(state: State<'_, AppState>) -> Result<Vec<Person>, String> {
+    with_any_session(&state, |conn| users::list_people(conn))
+}
+
+#[tauri::command]
+fn list_users(state: State<'_, AppState>) -> Result<Vec<User>, String> {
+    with_session(&state, Capability::ManageUsers, |conn| users::list_users(conn))
+}
+
+#[tauri::command]
+fn save_user(state: State<'_, AppState>, input: UserInput) -> Result<User, String> {
+    with_session(&state, Capability::ManageUsers, |conn| {
+        users::save_user(conn, &input)
+    })
+}
+
+#[tauri::command]
+fn delete_user(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    with_session(&state, Capability::ManageUsers, |conn| {
+        users::delete_user(conn, id)
+    })
+}
+
+#[tauri::command]
+fn list_time_entries(state: State<'_, AppState>) -> Result<Vec<TimeEntry>, String> {
+    with_session(&state, Capability::EnterTime, |conn| {
+        let viewer = users::current_user(conn)?;
+        users::list_time_entries(conn, &viewer)
+    })
+}
+
+#[tauri::command]
+fn save_time_entry(
+    state: State<'_, AppState>,
+    input: TimeEntryInput,
+) -> Result<TimeEntry, String> {
+    with_session(&state, Capability::EnterTime, |conn| {
+        let viewer = users::current_user(conn)?;
+        users::save_time_entry(conn, &viewer, &input)
+    })
+}
+
+#[tauri::command]
+fn delete_time_entry(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    with_session(&state, Capability::EnterTime, |conn| {
+        let viewer = users::current_user(conn)?;
+        users::delete_time_entry(conn, &viewer, id)
+    })
+}
+
+/// The folder a person means when they ask for a file on their computer.
+fn downloads_directory() -> PathBuf {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()
+        .map(PathBuf::from);
+
+    if let Some(home) = home {
+        let downloads = home.join("Downloads");
+        if downloads.is_dir() {
+            return downloads;
+        }
+        if home.is_dir() {
+            return home;
+        }
+    }
+    std::env::temp_dir()
+}
+
+/// Reduce any requested name to one harmless path segment ending in `.html`.
+fn safe_document_name(requested: &str) -> String {
+    let cleaned: String = requested
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            ch if ch.is_control() => '-',
+            ch => ch,
+        })
+        .collect();
+
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    let mut name: String = if trimmed.is_empty() {
+        "document".to_string()
+    } else {
+        trimmed.chars().take(90).collect()
+    };
+
+    if !name.to_ascii_lowercase().ends_with(".html") {
+        name.push_str(".html");
+    }
+    name
+}
+
+/// Never overwrite an earlier download: `Invoice.html`, `Invoice (2).html`, ...
+fn unused_path(directory: &std::path::Path, file_name: &str) -> PathBuf {
+    let candidate = directory.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let stem = file_name.strip_suffix(".html").unwrap_or(file_name);
+    for index in 2..10_000 {
+        let next = directory.join(format!("{stem} ({index}).html"));
+        if !next.exists() {
+            return next;
+        }
+    }
+    directory.join(format!("{stem}-{}.html", std::process::id()))
+}
+
+/// Save a printed document (invoice, P&L, tax summary, balance sheet) into the
+/// user's Downloads folder and hand back the full path so the app can show it.
+#[tauri::command]
+fn save_document(file_name: String, contents: String) -> Result<String, String> {
+    let directory = downloads_directory();
+    std::fs::create_dir_all(&directory)
+        .map_err(|err| format!("could not reach {}: {err}", directory.display()))?;
+
+    let path = unused_path(&directory, &safe_document_name(&file_name));
+    std::fs::write(&path, contents.as_bytes())
+        .map_err(|err| format!("could not save {}: {err}", path.display()))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod document_tests {
+    use super::*;
+
+    #[test]
+    fn document_names_stay_one_harmless_segment() {
+        assert_eq!(
+            safe_document_name("Invoice-INV-1001-2026-07-15.html"),
+            "Invoice-INV-1001-2026-07-15.html"
+        );
+
+        let traversal = safe_document_name("../../Windows/System32/evil");
+        assert!(!traversal.contains('/') && !traversal.contains('\\') && !traversal.contains(':'));
+        assert!(traversal.ends_with(".html"));
+
+        assert_eq!(safe_document_name("   "), "document.html");
+        assert_eq!(safe_document_name("Balance Sheet"), "Balance Sheet.html");
+    }
+
+    #[test]
+    fn an_existing_download_is_never_overwritten() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|gap| gap.as_nanos())
+            .unwrap_or(0);
+        let directory = std::env::temp_dir().join(format!("ledgerworks-docs-{stamp}"));
+        std::fs::create_dir_all(&directory).expect("temp folder");
+
+        let first = unused_path(&directory, "Balance-Sheet.html");
+        std::fs::write(&first, "x").expect("first copy");
+
+        let second = unused_path(&directory, "Balance-Sheet.html");
+        assert_eq!(second.file_name().unwrap(), "Balance-Sheet (2).html");
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .manage(AppState::default())
+        .invoke_handler(tauri::generate_handler![
+            list_companies,
+            companies_directory,
+            create_company,
+            open_company,
+            close_company,
+            current_company,
+            list_accounts,
+            create_account,
+            set_account_active,
+            list_journal_entries,
+            post_journal_entry,
+            void_journal_entry,
+            trial_balance,
+            verify_audit_chain,
+            list_audit_log,
+            ledger_health,
+            list_customers,
+            save_customer,
+            delete_customer,
+            list_vendors,
+            save_vendor,
+            delete_vendor,
+            list_inventory,
+            save_inventory_item,
+            delete_inventory_item,
+            list_income,
+            save_income,
+            delete_income,
+            list_expenses,
+            save_expense,
+            delete_expense,
+            list_invoices,
+            get_invoice,
+            save_invoice,
+            delete_invoice,
+            list_recurring_invoices,
+            save_recurring_invoice,
+            delete_recurring_invoice,
+            generate_due_invoices,
+            list_purchases,
+            save_purchase,
+            delete_purchase,
+            list_payroll,
+            preview_payroll,
+            save_payroll,
+            delete_payroll,
+            list_employees,
+            save_employee,
+            delete_employee,
+            mileage_due,
+            list_estimates,
+            get_estimate,
+            save_estimate,
+            delete_estimate,
+            convert_estimate_to_order,
+            convert_estimate_to_invoice,
+            list_sales_orders,
+            get_sales_order,
+            save_sales_order,
+            delete_sales_order,
+            convert_sales_order_to_invoice,
+            dashboard,
+            profit_and_loss,
+            balance_sheet,
+            tax_summary,
+            list_settings,
+            save_setting,
+            list_credit_memos,
+            get_credit_memo,
+            save_credit_memo,
+            delete_credit_memo,
+            void_credit_memo,
+            current_user,
+            switch_user,
+            list_people,
+            list_users,
+            save_user,
+            delete_user,
+            list_time_entries,
+            save_time_entry,
+            delete_time_entry,
+            save_document
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running LedgerWorks");
+}
