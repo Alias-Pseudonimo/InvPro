@@ -7,7 +7,7 @@ use rusqlite::Connection;
 
 use crate::schema::{
     migration_2, migration_3, migration_4, migration_5, migration_6, migration_7, migration_8,
-    MIGRATION_1, SCHEMA_VERSION,
+    migration_9, MIGRATION_1, SCHEMA_VERSION,
 };
 use crate::{CoreError, Result};
 
@@ -87,6 +87,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         // v8 makes payroll an access level of its own, so the roster and the pay
         // runs are not open to every person who can raise an invoice.
         conn.execute_batch(&migration_8())?;
+    }
+    if version < 9 {
+        // v9 separates a purchase line that buys stock (an asset) from one that
+        // is a cost, so the same goods never reach profit twice.
+        conn.execute_batch(&migration_9())?;
     }
     if version < SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -354,6 +359,57 @@ mod tests {
             )
             .is_err());
 
+        assert_eq!(integrity_check(&conn).unwrap(), "ok");
+    }
+
+    #[test]
+    fn a_version_eight_file_keeps_its_purchase_lines_as_stock() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        conn.execute_batch(MIGRATION_1).unwrap();
+        for upgrade in [
+            migration_2(),
+            migration_3(),
+            migration_4(),
+            migration_5(),
+            migration_6(),
+            migration_7(),
+            migration_8(),
+        ] {
+            conn.execute_batch(&upgrade).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 8).unwrap();
+
+        conn.execute(
+            "INSERT INTO purchases (purchase_date) VALUES ('2026-01-04')",
+            [],
+        )
+        .unwrap();
+        let purchase = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO purchase_lines (purchase_id, position, description, qty_hundredths, unit_cost_cents)
+             VALUES (?1, 1, 'Old stock', 500, 900)",
+            [purchase],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let is_stock: i64 = conn
+            .query_row("SELECT is_stock FROM purchase_lines", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(is_stock, 1, "an old line moved stock, so it is still stock");
+
+        // The audit image was rebuilt to name the new column.
+        let image: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'trg_audit_purchase_lines_ins'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(image.contains("is_stock"));
         assert_eq!(integrity_check(&conn).unwrap(), "ok");
     }
 }

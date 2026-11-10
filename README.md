@@ -38,8 +38,17 @@ What the owner records, and what the books receive:
 | Invoice marked **Sent** | Accounts Receivable | revenue + sales tax payable |
 | Invoice sold stock | Cost of goods sold | Inventory |
 | Invoice marked **Paid** | Checking | Accounts Receivable |
-| Purchase | the purchase category | Checking or Accounts Payable |
+| Purchase of stock | Inventory | Checking or Accounts Payable |
+| Purchase of something used up | the purchase category you typed | Checking or Accounts Payable |
 | Pay run | Wages | Checking (net) + payroll liabilities |
+
+A purchase line says which of the last two it is. Stock waits in Inventory and
+becomes a cost once, as cost of goods sold, when the item is invoiced; a line
+marked as an expense is a cost now. The same goods never reach profit twice, and
+the category may be left blank on a stock-only purchase — nothing extra is
+posted, and the cost still arrives once when the item sells. Naming an account
+that disagrees with the one an item is already recorded under is refused, with
+both accounts named, rather than posted to a second place.
 
 Editing any record voids its previous entry and posts the corrected one — the
 ledger is never silently rewritten. Deleting reverses the entry the same way.
@@ -68,11 +77,17 @@ Both operations appear in the audit trail.
 - **Recurring invoices** — weekly, monthly, quarterly or yearly schedules that
   raise a real sent invoice for each cycle, dated the day it fell due; missed
   cycles are caught up the next time invoices are generated.
-- **Purchases** — one record updates quantity, weighted-average cost, the linked
-  expense posting, and vendor history. New item names are created on the way
-  through.
+- **Purchases** — one record updates quantity, weighted-average cost, the stock
+  or expense posting, and vendor history. A line left on *new stock item*
+  creates the item; a line marked *not stock, just an expense* is a cost now and
+  lands in the category you pick from the menu (or add). The category is
+  optional: *none: stock only* keeps the whole purchase in Inventory. An item
+  already recorded under one cost account is refused under another, so one cost
+  never lands in two places. Editing a purchase voids and reposts its entry, so
+  a past purchase booked the old way is corrected by saving it again.
 - **Inventory** — products, consumables and services; quantity, cost, sell price,
-  stock value.
+  stock value. An item's category names the cost account it is recorded under, so
+  a purchase that names a different account is refused rather than posted twice.
 - **Payroll** — gross from rate × hours plus 1.5× overtime, or a yearly salary
   split into the employee's own pay frequency (weekly, every two weeks, twice a
   month, or monthly — 52, 26, 24 or 12 checks), plus net pay and a balanced

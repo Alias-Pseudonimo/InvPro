@@ -298,6 +298,21 @@ pub(crate) fn customer_credit_account(conn: &mut Connection) -> Result<i64> {
     )
 }
 
+/// An account a category already names, if there is one. Unlike
+/// [`category_account`] this never creates anything: a check that is about to
+/// refuse a save must not leave an account behind on the way out.
+fn existing_expense_account(conn: &Connection, name: &str) -> Result<Option<(i64, String)>> {
+    Ok(conn
+        .query_row(
+            "SELECT id, name FROM accounts
+              WHERE lower(name) = lower(?1) AND is_active = 1
+                AND type IN ('EXPENSE', 'COGS', 'OTHER_EXPENSE')",
+            [name.trim()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
 /// Find (or create) the account behind a category the owner typed.
 pub(crate) fn category_account(
     conn: &mut Connection,
@@ -649,6 +664,14 @@ pub struct InventoryItem {
     pub sale_price_cents: i64,
     pub is_active: bool,
     pub stock_value_cents: i64,
+    /// Units taken in by purchases, all time. Compared with the quantity on
+    /// hand it answers the only question a buyer actually asks: is this stock
+    /// moving, or is it sitting on the shelf while I keep ordering more?
+    pub bought_hundredths: i64,
+    /// Units taken out by posted invoices, all time.
+    pub sold_hundredths: i64,
+    /// The last date this item moved in or out, or null if it never has.
+    pub last_movement: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -691,17 +714,36 @@ fn map_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InventoryItem> {
         sale_price_cents: row.get(8)?,
         is_active: row.get::<_, i64>(9)? != 0,
         stock_value_cents: line_total(qty, cost),
+        bought_hundredths: row.get(10)?,
+        sold_hundredths: row.get(11)?,
+        last_movement: row.get(12)?,
     })
 }
 
 const SELECT_ITEM: &str = r#"
-SELECT id, name, sku, barcode, category, kind, qty_hundredths, unit_cost_cents,
-       sale_price_cents, is_active
-FROM inventory_items
+SELECT i.id, i.name, i.sku, i.barcode, i.category, i.kind, i.qty_hundredths,
+       i.unit_cost_cents, i.sale_price_cents, i.is_active,
+       COALESCE((SELECT SUM(pl.qty_hundredths) FROM purchase_lines pl
+                  WHERE pl.inventory_item_id = i.id), 0) AS bought,
+       COALESCE((SELECT SUM(il.qty_hundredths) FROM invoice_lines il
+                   JOIN invoices inv ON inv.id = il.invoice_id
+                  WHERE il.inventory_item_id = i.id AND inv.stock_deducted = 1), 0) AS sold,
+       (SELECT MAX(day) FROM (
+            SELECT pu.purchase_date AS day
+              FROM purchase_lines pl2
+              JOIN purchases pu ON pu.id = pl2.purchase_id
+             WHERE pl2.inventory_item_id = i.id
+            UNION ALL
+            SELECT inv2.invoice_date
+              FROM invoice_lines il2
+              JOIN invoices inv2 ON inv2.id = il2.invoice_id
+             WHERE il2.inventory_item_id = i.id AND inv2.stock_deducted = 1
+        )) AS last_movement
+FROM inventory_items i
 "#;
 
 pub fn list_inventory(conn: &Connection) -> Result<Vec<InventoryItem>> {
-    let mut stmt = conn.prepare(&format!("{SELECT_ITEM} ORDER BY lower(name)"))?;
+    let mut stmt = conn.prepare(&format!("{SELECT_ITEM} ORDER BY lower(i.name)"))?;
     let rows = stmt.query_map([], map_item)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
@@ -770,7 +812,7 @@ pub fn save_inventory_item(conn: &mut Connection, input: &InventoryInput) -> Res
 }
 
 pub fn item_by_id(conn: &Connection, id: i64) -> Result<InventoryItem> {
-    conn.prepare(&format!("{SELECT_ITEM} WHERE id = ?1"))?
+    conn.prepare(&format!("{SELECT_ITEM} WHERE i.id = ?1"))?
         .query_row([id], map_item)
         .optional()?
         .ok_or_else(|| CoreError::not_found(format!("item {id} does not exist")))
@@ -2409,6 +2451,16 @@ pub struct PurchaseLineInput {
     #[serde(default)]
     pub sale_price_cents: i64,
     pub inventory_item_id: Option<i64>,
+    /// Whether this line puts stock on the shelf (an asset) or is simply a cost
+    /// of doing business. Only an expense line may reach the category account;
+    /// stock waits in Inventory until the item is sold, so the same goods never
+    /// reach profit twice.
+    #[serde(default = "tracks_stock")]
+    pub is_stock: bool,
+}
+
+fn tracks_stock() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2437,6 +2489,7 @@ pub struct PurchaseLine {
     pub sale_price_cents: i64,
     pub amount_cents: i64,
     pub inventory_item_id: Option<i64>,
+    pub is_stock: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2456,7 +2509,7 @@ pub struct Purchase {
 fn purchase_lines_of(conn: &Connection, purchase_id: i64) -> Result<Vec<PurchaseLine>> {
     let mut stmt = conn.prepare(
         "SELECT id, position, description, qty_hundredths, unit_cost_cents, sale_price_cents,
-                inventory_item_id
+                inventory_item_id, is_stock
            FROM purchase_lines WHERE purchase_id = ?1 ORDER BY position",
     )?;
     let rows = stmt.query_map([purchase_id], |row| {
@@ -2471,6 +2524,7 @@ fn purchase_lines_of(conn: &Connection, purchase_id: i64) -> Result<Vec<Purchase
             sale_price_cents: row.get(5)?,
             amount_cents: line_total(qty, cost),
             inventory_item_id: row.get(6)?,
+            is_stock: row.get::<_, i64>(7)? != 0,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -2521,11 +2575,9 @@ pub fn list_purchases(conn: &Connection) -> Result<Vec<Purchase>> {
 
 pub fn save_purchase(conn: &mut Connection, input: &PurchaseInput) -> Result<Purchase> {
     let day = checked_date(&input.purchase_date, "the date")?;
-    let category = if input.category.trim().is_empty() {
-        "Materials".to_string()
-    } else {
-        input.category.trim().to_string()
-    };
+    // A blank category is a real answer, not a missing one: the purchase is
+    // stock only, so nothing beyond the inventory asset changes.
+    let category = input.category.trim().to_string();
 
     let mut lines: Vec<PurchaseLineInput> = Vec::new();
     for (index, line) in input.lines.iter().enumerate() {
@@ -2560,9 +2612,96 @@ pub fn save_purchase(conn: &mut Connection, input: &PurchaseInput) -> Result<Pur
         return Err(CoreError::validation("a purchase must be worth more than zero"));
     }
 
-    let (expense_account, stored_category) = category_account(conn, &category, AccountType::Expense)?;
+    // Split what was bought into the two things it can be. Stock is an asset
+    // that waits on the shelf; only the rest is a cost the business has already
+    // incurred. Posting the whole purchase to a category is what used to make
+    // the same goods reach profit twice — once when bought, once as cost of
+    // goods sold when sold.
+    let stock_total: i64 = lines
+        .iter()
+        .filter(|line| line.is_stock)
+        .map(|line| line_total(line.qty_hundredths, line.unit_cost_cents))
+        .sum();
+    let expense_total = total - stock_total;
+
     let cash = cash_account(conn)?;
     let payable = payable_account(conn)?;
+    if expense_total > 0 && category.is_empty() {
+        return Err(CoreError::validation(
+            "give the expense lines a category, or link them to stock so their cost sits in Inventory instead",
+        ));
+    }
+
+    // An item already recorded under one cost account cannot be bought under
+    // another: the same cost would land in two places on the profit and loss.
+    // This is the mistake the old purchase screen invited, so it is refused
+    // rather than silently posted.
+    if expense_total == 0 && !category.is_empty() {
+        {
+            // A name the chart does not hold yet counts as its own account: it
+            // would be created on the way through, so it cannot agree with an
+            // item that is already recorded somewhere else.
+            let purchase_account = existing_expense_account(conn, &category)?;
+            let purchase_name = purchase_account
+                .as_ref()
+                .map(|(_, name)| name.clone())
+                .unwrap_or_else(|| category.clone());
+            for line in lines.iter().filter(|line| line.is_stock) {
+                // A typed name that matches an item already on file is the same
+                // item, so it gets the same check as one picked from the list.
+                let item_id = match line.inventory_item_id {
+                    Some(id) => Some(id),
+                    None if !line.description.trim().is_empty() => conn
+                        .query_row(
+                            "SELECT id FROM inventory_items WHERE lower(name) = lower(?1)",
+                            [line.description.trim()],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()?,
+                    None => None,
+                };
+                let Some(item_id) = item_id else {
+                    continue;
+                };
+                let (item_name, item_category): (String, String) = conn.query_row(
+                    "SELECT name, category FROM inventory_items WHERE id = ?1",
+                    [item_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                if item_category.trim().is_empty() {
+                    continue;
+                }
+                if let Some((item_account, item_account_name)) =
+                    existing_expense_account(conn, &item_category)?
+                {
+                    let agrees = purchase_account
+                        .as_ref()
+                        .map(|(id, _)| *id == item_account)
+                        .unwrap_or(false);
+                    if !agrees {
+                        return Err(CoreError::validation(format!(
+                            "'{item_name}' is recorded under {item_account_name}, so this purchase cannot be \
+                             categorized as {purchase_name}. Use {item_account_name}, leave the category blank, \
+                             or change the item's category in Inventory first."
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    let stock_account = if stock_total > 0 {
+        Some(inventory_account(conn)?)
+    } else {
+        None
+    };
+    let (expense_account, stored_category) = if expense_total > 0 {
+        let (id, name) = category_account(conn, &category, AccountType::Expense)?;
+        (Some(id), name)
+    } else {
+        (None, category.clone())
+    };
+    let booked_account = expense_account.or(stock_account).expect("a purchase posts somewhere");
 
     let previous = match input.id {
         Some(id) => {
@@ -2583,21 +2722,33 @@ pub fn save_purchase(conn: &mut Connection, input: &PurchaseInput) -> Result<Pur
         None => Vec::new(),
     };
 
-    let memo = format!("{stored_category} purchase");
+    let memo = if expense_total > 0 {
+        format!("{stored_category} purchase")
+    } else {
+        "Stock purchase".to_string()
+    };
+    let mut posting = Vec::new();
+    if let Some(account) = stock_account {
+        posting.push(line(account, stock_total, 0));
+    }
+    if let Some(account) = expense_account {
+        posting.push(line(account, expense_total, 0));
+    }
+    posting.push(line(if input.is_paid { cash } else { payable }, 0, total));
     let entry = JournalEntryInput {
         entry_date: day.clone(),
         memo,
         reference: None,
         source: EntrySource::Bill,
-        lines: vec![
-            line(expense_account, total, 0),
-            line(if input.is_paid { cash } else { payable }, 0, total),
-        ],
+        lines: posting,
     };
 
     let tx = conn.transaction()?;
     if let Some(entry_id) = &previous {
         for line in &previous_lines {
+            if !line.is_stock {
+                continue;
+            }
             if let Some(item_id) = line.inventory_item_id {
                 stock_in_reverse(&tx, item_id, line.qty_hundredths, line.unit_cost_cents)?;
             }
@@ -2619,7 +2770,7 @@ pub fn save_purchase(conn: &mut Connection, input: &PurchaseInput) -> Result<Pur
                     day,
                     input.vendor_id,
                     stored_category,
-                    expense_account,
+                    booked_account,
                     input.note.trim(),
                     input.is_paid as i64
                 ],
@@ -2635,7 +2786,7 @@ pub fn save_purchase(conn: &mut Connection, input: &PurchaseInput) -> Result<Pur
                     day,
                     input.vendor_id,
                     stored_category,
-                    expense_account,
+                    booked_account,
                     input.note.trim(),
                     input.is_paid as i64
                 ],
@@ -2648,8 +2799,8 @@ pub fn save_purchase(conn: &mut Connection, input: &PurchaseInput) -> Result<Pur
         let mut stmt = tx.prepare(
             "INSERT INTO purchase_lines
                 (purchase_id, position, description, qty_hundredths, unit_cost_cents,
-                 sale_price_cents, inventory_item_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 sale_price_cents, inventory_item_id, is_stock)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
         for (index, line) in lines.iter().enumerate() {
             stmt.execute(params![
@@ -2659,7 +2810,8 @@ pub fn save_purchase(conn: &mut Connection, input: &PurchaseInput) -> Result<Pur
                 line.qty_hundredths,
                 line.unit_cost_cents,
                 line.sale_price_cents,
-                line.inventory_item_id
+                if line.is_stock { line.inventory_item_id } else { None },
+                line.is_stock as i64
             ])?;
         }
     }
@@ -2667,6 +2819,9 @@ pub fn save_purchase(conn: &mut Connection, input: &PurchaseInput) -> Result<Pur
     // Buying stock: an existing item moves in at weighted-average cost; a new
     // name creates the item so stock tracking never blocks the bookkeeping.
     for (index, line) in lines.iter().enumerate() {
+        if !line.is_stock {
+            continue;
+        }
         let position = (index as i64) + 1;
         let item_id = match line.inventory_item_id {
             Some(item_id) => Some(item_id),
@@ -2737,6 +2892,9 @@ pub fn delete_purchase(conn: &mut Connection, id: i64) -> Result<()> {
 
     let tx = conn.transaction()?;
     for line in &lines {
+        if !line.is_stock {
+            continue;
+        }
         if let Some(item_id) = line.inventory_item_id {
             stock_in_reverse(&tx, item_id, line.qty_hundredths, line.unit_cost_cents)?;
         }

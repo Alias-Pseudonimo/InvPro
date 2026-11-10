@@ -182,6 +182,9 @@ export interface InventoryItem {
   salePriceCents: number;
   isActive: boolean;
   stockValueCents: number;
+  boughtHundredths: number;
+  soldHundredths: number;
+  lastMovement: string | null;
 }
 
 export interface InventoryInput {
@@ -338,6 +341,8 @@ export interface PurchaseLine {
   salePriceCents: number;
   amountCents: number;
   inventoryItemId: number | null;
+  /** Stock on the shelf (an asset) rather than a cost already incurred. */
+  isStock: boolean;
 }
 
 export interface Purchase {
@@ -358,6 +363,7 @@ export interface PurchaseLineInput {
   unitCostCents: number;
   salePriceCents: number;
   inventoryItemId?: number | null;
+  isStock?: boolean;
 }
 
 export interface PurchaseInput {

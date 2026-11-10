@@ -370,6 +370,7 @@ fn purchases_bring_stock_in_at_a_weighted_average_cost() {
                 unit_cost_cents: 1_900,
                 sale_price_cents: 2_900,
                 inventory_item_id: None,
+                is_stock: true,
             }],
         },
     )
@@ -398,6 +399,7 @@ fn purchases_bring_stock_in_at_a_weighted_average_cost() {
                 unit_cost_cents: 2_100,
                 sale_price_cents: 2_900,
                 inventory_item_id: Some(created.id),
+                is_stock: true,
             }],
         },
     )
@@ -406,10 +408,303 @@ fn purchases_bring_stock_in_at_a_weighted_average_cost() {
     let after = simple::item_by_id(&conn, created.id).unwrap();
     assert_eq!(after.qty_hundredths, 2_000);
     assert_eq!(after.unit_cost_cents, 2_000, "weighted average of 19.00 and 21.00");
+
+    // Stock bought is an asset until it sells. Posting it to the Materials
+    // category as well as booking cost of goods sold on the sale is what made
+    // the same goods reach profit twice.
     assert_eq!(
         simple::profit_and_loss(&conn, None, None).unwrap().total_expense_cents,
-        40_000
+        0,
+        "a purchase of stock is not a cost yet"
     );
+    let sheet = simple::balance_sheet(&conn, None).unwrap();
+    let inventory = sheet
+        .assets
+        .iter()
+        .find(|row| row.name == "Inventory")
+        .expect("stock is on the balance sheet");
+    assert_eq!(inventory.amount_cents, 40_000, "2,000 units at the 20.00 average");
+    assert!(sheet.balanced);
+}
+
+#[test]
+fn a_stock_purchase_becomes_a_cost_once_when_the_item_sells() {
+    let mut conn = company();
+    let purchase = simple::save_purchase(
+        &mut conn,
+        &PurchaseInput {
+            id: None,
+            purchase_date: "2026-08-02".into(),
+            vendor_id: None,
+            category: "Materials".into(),
+            note: String::new(),
+            is_paid: true,
+            lines: vec![PurchaseLineInput {
+                description: "Cedar post".into(),
+                qty_hundredths: 1_000,
+                unit_cost_cents: 1_000,
+                sale_price_cents: 2_500,
+                inventory_item_id: None,
+                is_stock: true,
+            }],
+        },
+    )
+    .unwrap();
+
+    let pnl = simple::profit_and_loss(&conn, None, None).unwrap();
+    assert_eq!(pnl.total_expense_cents, 0, "bought stock is not a cost yet");
+    assert!(
+        pnl.expenses.iter().all(|row| row.name != "Materials" && row.name != "Lumber"),
+        "the purchase category stays off the profit and loss"
+    );
+
+    let item = purchase.lines[0]
+        .inventory_item_id
+        .expect("the purchase created the item");
+    simple::save_invoice(
+        &mut conn,
+        &InvoiceInput {
+            id: None,
+            invoice_no: None,
+            customer_id: None,
+            invoice_date: "2026-08-09".into(),
+            due_date: None,
+            status: "Sent".into(),
+            tax_bp: 0,
+            lines: vec![InvoiceLineInput {
+                description: "Cedar post".into(),
+                qty_hundredths: 400,
+                unit_price_cents: 2_500,
+                inventory_item_id: Some(item),
+            }],
+        },
+    )
+    .unwrap();
+
+    let pnl = simple::profit_and_loss(&conn, None, None).unwrap();
+    assert_eq!(pnl.total_income_cents, 10_000);
+    assert_eq!(pnl.total_expense_cents, 4_000, "four units at the 10.00 cost");
+    assert_eq!(pnl.expenses.len(), 1, "the cost appears once, not twice");
+    assert_eq!(pnl.expenses[0].name, "Cost of Goods Sold");
+
+    let sheet = simple::balance_sheet(&conn, None).unwrap();
+    let inventory = sheet
+        .assets
+        .iter()
+        .find(|row| row.name == "Inventory")
+        .expect("the unsold stock is still an asset");
+    assert_eq!(inventory.amount_cents, 6_000, "six units left at 10.00");
+    assert!(sheet.balanced);
+}
+
+#[test]
+fn one_account_never_turns_up_twice_on_the_profit_and_loss() {
+    let mut conn = company();
+    // Buy stock and capitalize it; the cost is recognized when it sells.
+    let purchase = simple::save_purchase(
+        &mut conn,
+        &PurchaseInput {
+            id: None,
+            purchase_date: "2026-08-02".into(),
+            vendor_id: None,
+            category: "Cost of Goods Sold".into(),
+            note: String::new(),
+            is_paid: true,
+            lines: vec![PurchaseLineInput {
+                description: "Cedar post".into(),
+                qty_hundredths: 1_000,
+                unit_cost_cents: 1_000,
+                sale_price_cents: 2_500,
+                inventory_item_id: None,
+                is_stock: true,
+            }],
+        },
+    )
+    .unwrap();
+    let item = purchase.lines[0].inventory_item_id.unwrap();
+    simple::save_invoice(
+        &mut conn,
+        &InvoiceInput {
+            id: None,
+            invoice_no: None,
+            customer_id: None,
+            invoice_date: "2026-08-09".into(),
+            due_date: None,
+            status: "Sent".into(),
+            tax_bp: 0,
+            lines: vec![InvoiceLineInput {
+                description: "Cedar post".into(),
+                qty_hundredths: 400,
+                unit_price_cents: 2_500,
+                inventory_item_id: Some(item),
+            }],
+        },
+    )
+    .unwrap();
+    // And a direct cost posted to the same account on purpose.
+    simple::save_purchase(
+        &mut conn,
+        &PurchaseInput {
+            id: None,
+            purchase_date: "2026-08-03".into(),
+            vendor_id: None,
+            category: "Cost of Goods Sold".into(),
+            note: String::new(),
+            is_paid: true,
+            lines: vec![PurchaseLineInput {
+                description: "Site delivery".into(),
+                qty_hundredths: 100,
+                unit_cost_cents: 1_000,
+                sale_price_cents: 0,
+                inventory_item_id: None,
+                is_stock: false,
+            }],
+        },
+    )
+    .unwrap();
+
+    let pnl = simple::profit_and_loss(&conn, None, None).unwrap();
+    let cogs: Vec<_> = pnl
+        .expenses
+        .iter()
+        .filter(|row| row.name == "Cost of Goods Sold")
+        .collect();
+    assert_eq!(cogs.len(), 1, "the same account is one row, not two");
+    assert_eq!(cogs[0].amount_cents, 5_000, "4,000 sold plus 1,000 delivery");
+    assert_eq!(pnl.total_expense_cents, 5_000);
+}
+
+#[test]
+fn a_purchase_cannot_book_an_item_under_a_different_account() {
+    let mut conn = company();
+    let item = simple::save_inventory_item(
+        &mut conn,
+        &simple::InventoryInput {
+            id: None,
+            name: "Cedar post".into(),
+            sku: String::new(),
+            barcode: String::new(),
+            category: "Cost of Goods Sold".into(),
+            kind: "Product".into(),
+            qty_hundredths: 0,
+            unit_cost_cents: 1_000,
+            sale_price_cents: 2_500,
+        },
+    )
+    .unwrap();
+
+    let buying = |category: &str| PurchaseInput {
+        id: None,
+        purchase_date: "2026-08-02".into(),
+        vendor_id: None,
+        category: category.into(),
+        note: String::new(),
+        is_paid: true,
+        lines: vec![PurchaseLineInput {
+            description: "Cedar post".into(),
+            qty_hundredths: 500,
+            unit_cost_cents: 1_000,
+            sale_price_cents: 2_500,
+            inventory_item_id: Some(item.id),
+            is_stock: true,
+        }],
+    };
+
+    let refused = simple::save_purchase(&mut conn, &buying("Materials")).unwrap_err();
+    let message = refused.to_string();
+    assert!(message.contains("recorded under Cost of Goods Sold"), "{message}");
+    assert!(message.contains("Materials"), "{message}");
+
+    // Blank is fine: the purchase is stock only and touches no expense account.
+    simple::save_purchase(&mut conn, &buying("")).expect("a blank category is allowed");
+    // Agreeing with the item's account is fine too, and still posts once.
+    simple::save_purchase(&mut conn, &buying("Cost of Goods Sold"))
+        .expect("the same account is allowed");
+    assert_eq!(
+        simple::profit_and_loss(&conn, None, None).unwrap().total_expense_cents,
+        0,
+        "stock bought is an asset, whatever the purchase is labelled"
+    );
+}
+
+#[test]
+fn an_expense_line_needs_a_category() {
+    let mut conn = company();
+    let refused = simple::save_purchase(
+        &mut conn,
+        &PurchaseInput {
+            id: None,
+            purchase_date: "2026-08-03".into(),
+            vendor_id: None,
+            category: String::new(),
+            note: String::new(),
+            is_paid: true,
+            lines: vec![PurchaseLineInput {
+                description: "Diesel".into(),
+                qty_hundredths: 100,
+                unit_cost_cents: 8_000,
+                sale_price_cents: 0,
+                inventory_item_id: None,
+                is_stock: false,
+            }],
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(refused.contains("give the expense lines a category"), "{refused}");
+}
+
+#[test]
+fn an_expense_line_on_a_purchase_never_lands_in_stock() {
+    let mut conn = company();
+    simple::save_purchase(
+        &mut conn,
+        &PurchaseInput {
+            id: None,
+            purchase_date: "2026-08-03".into(),
+            vendor_id: None,
+            category: "Vehicle & Fuel".into(),
+            note: String::new(),
+            is_paid: true,
+            lines: vec![
+                PurchaseLineInput {
+                    description: "Diesel".into(),
+                    qty_hundredths: 100,
+                    unit_cost_cents: 8_000,
+                    sale_price_cents: 0,
+                    inventory_item_id: None,
+                    is_stock: false,
+                },
+                PurchaseLineInput {
+                    description: "Sandpaper".into(),
+                    qty_hundredths: 200,
+                    unit_cost_cents: 1_000,
+                    sale_price_cents: 0,
+                    inventory_item_id: None,
+                    is_stock: true,
+                },
+            ],
+        },
+    )
+    .unwrap();
+
+    let pnl = simple::profit_and_loss(&conn, None, None).unwrap();
+    assert_eq!(pnl.total_expense_cents, 8_000, "only the fuel is a cost");
+    assert_eq!(pnl.expenses[0].name, "Vehicle & Fuel");
+
+    let items = simple::list_inventory(&conn).unwrap();
+    assert_eq!(items.len(), 1, "only the stock line created an item");
+    assert_eq!(items[0].name, "Sandpaper");
+    assert_eq!(items[0].qty_hundredths, 200);
+
+    let sheet = simple::balance_sheet(&conn, None).unwrap();
+    let inventory = sheet
+        .assets
+        .iter()
+        .find(|row| row.name == "Inventory")
+        .expect("the stock line is an asset");
+    assert_eq!(inventory.amount_cents, 2_000);
+    assert!(sheet.balanced);
 }
 
 #[test]
@@ -553,6 +848,7 @@ fn the_audit_chain_survives_a_full_day_of_bookkeeping() {
                 unit_cost_cents: 1_000,
                 sale_price_cents: 2_000,
                 inventory_item_id: None,
+                is_stock: true,
             }],
         },
     )
@@ -824,4 +1120,75 @@ fn a_schedule_stops_at_its_end_date() {
     assert!(!schedule.is_active, "nothing is left to invoice");
     assert_eq!(schedule.next_date, "2026-04-15");
     assert!(simple::generate_due_invoices(&mut conn, "2026-12-31").unwrap().is_empty());
+}
+
+#[test]
+fn an_item_reports_what_came_in_what_went_out_and_when_it_last_moved() {
+    let mut conn = company();
+    // Five boxes of nails bought on spec, so they sit in Inventory rather than
+    // on the profit and loss. The item itself has to make that visible.
+    let purchase = simple::save_purchase(
+        &mut conn,
+        &PurchaseInput {
+            id: None,
+            purchase_date: "2026-08-04".into(),
+            vendor_id: None,
+            category: String::new(),
+            note: String::new(),
+            is_paid: true,
+            lines: vec![PurchaseLineInput {
+                description: "2 1/2 inch nails".into(),
+                qty_hundredths: 500,
+                unit_cost_cents: 1_200,
+                sale_price_cents: 0,
+                inventory_item_id: None,
+                is_stock: true,
+            }],
+        },
+    )
+    .unwrap();
+    let item_id = purchase.lines[0].inventory_item_id.expect("the purchase created the item");
+
+    let item = simple::item_by_id(&conn, item_id).unwrap();
+    assert_eq!(item.qty_hundredths, 500);
+    assert_eq!(item.stock_value_cents, 6_000, "five boxes at 12.00");
+    assert_eq!(item.bought_hundredths, 500);
+    assert_eq!(item.sold_hundredths, 0, "nothing has been used or sold");
+    assert_eq!(item.last_movement.as_deref(), Some("2026-08-04"));
+
+    // Nothing of this purchase has reached the profit and loss yet.
+    assert_eq!(
+        simple::profit_and_loss(&conn, None, None).unwrap().total_expense_cents,
+        0
+    );
+
+    simple::save_invoice(
+        &mut conn,
+        &InvoiceInput {
+            id: None,
+            invoice_no: None,
+            customer_id: None,
+            invoice_date: "2026-08-09".into(),
+            due_date: None,
+            status: "Sent".into(),
+            tax_bp: 0,
+            lines: vec![InvoiceLineInput {
+                description: "2 1/2 inch nails".into(),
+                qty_hundredths: 200,
+                unit_price_cents: 2_000,
+                inventory_item_id: Some(item_id),
+            }],
+        },
+    )
+    .unwrap();
+
+    let item = simple::item_by_id(&conn, item_id).unwrap();
+    assert_eq!(item.bought_hundredths, 500, "gross units bought never falls");
+    assert_eq!(item.sold_hundredths, 200);
+    assert_eq!(item.qty_hundredths, 300, "three boxes still on the shelf");
+    assert_eq!(item.stock_value_cents, 3_600);
+    assert_eq!(item.last_movement.as_deref(), Some("2026-08-09"));
+
+    let pnl = simple::profit_and_loss(&conn, None, None).unwrap();
+    assert_eq!(pnl.total_expense_cents, 2_400, "only the two boxes that left");
 }

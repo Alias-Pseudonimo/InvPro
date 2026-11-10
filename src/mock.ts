@@ -348,6 +348,9 @@ function seed() {
       salePriceCents: price,
       isActive: true,
       stockValueCents: qty * cost,
+      boughtHundredths: qty * 100,
+      soldHundredths: 0,
+      lastMovement: null,
     };
     state.items.push(record);
     return record;
@@ -490,6 +493,7 @@ function seed() {
         salePriceCents: 2_400,
         amountCents: 14_500,
         inventoryItemId: posts.id,
+        isStock: true,
       },
     ];
     const record: Purchase = {
@@ -884,8 +888,12 @@ function totals() {
   const invoiceRevenue = state.invoices.filter((invoice) => invoice.status !== "Draft").reduce((sum, invoice) => sum + invoice.subtotalCents, 0);
   const invoiceTax = state.invoices.filter((invoice) => invoice.status !== "Draft").reduce((sum, invoice) => sum + invoice.taxCents, 0);
   const income = state.income.reduce((sum, record) => sum + record.amountCents, 0) + invoiceRevenue;
+  // Stock bought and not yet sold is an asset, not a cost, so only the expense
+  // lines of a purchase reach this number — exactly as the engine posts it.
+  const purchaseExpense = (record: Purchase) =>
+    record.lines.filter((line) => !line.isStock).reduce((sum, line) => sum + line.amountCents, 0);
   const expenses = state.expenses.reduce((sum, record) => sum + record.totalCents, 0)
-    + state.purchases.reduce((sum, record) => sum + record.totalCents, 0)
+    + state.purchases.reduce((sum, record) => sum + purchaseExpense(record), 0)
     + state.payroll.reduce((sum, record) => sum + record.grossCents + record.additionsCents, 0);
   const cash = state.income.filter((record) => record.isPaid).reduce((sum, record) => sum + record.totalCents, 0)
     + state.invoices.filter((invoice) => invoice.status === "Paid").reduce((sum, invoice) => sum + invoice.totalCents, 0)
@@ -921,14 +929,17 @@ function profitAndLoss(): ProfitAndLoss {
   ];
   const expenseRows = [
     ...state.expenses.map((record) => ({ category: record.category, amountCents: record.totalCents })),
-    ...state.purchases.map((record) => ({ category: record.category, amountCents: record.totalCents })),
+    ...state.purchases.map((record) => ({
+      category: record.category,
+      amountCents: record.lines.filter((line) => !line.isStock).reduce((sum, line) => sum + line.amountCents, 0),
+    })),
     ...state.payroll.map((record) => ({ category: "Payroll Expense", amountCents: record.grossCents })),
     ...state.payroll
       .filter((record) => record.additionsCents > 0)
       .map((record) => ({ category: "Employee Reimbursements", amountCents: record.additionsCents })),
   ];
-  const income = groupByCategory(incomeRows);
-  const expenses = groupByCategory(expenseRows);
+  const income = groupByCategory(incomeRows).filter((row) => row.amountCents !== 0);
+  const expenses = groupByCategory(expenseRows).filter((row) => row.amountCents !== 0);
   const totalIncomeCents = income.reduce((sum, row) => sum + row.amountCents, 0);
   const totalExpenseCents = expenses.reduce((sum, row) => sum + row.amountCents, 0);
   return {
@@ -1394,15 +1405,40 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
     case "list_inventory":
       requireOpen();
       return state.items
-        .map((item) => ({
-          ...item,
-          stockValueCents: Math.round((item.qtyHundredths * item.unitCostCents) / 100),
-        }))
+        .map((item) => {
+          const purchases = state.purchases.filter((purchase) =>
+            purchase.lines.some((line) => line.inventoryItemId === item.id),
+          );
+          const bought = purchases.reduce(
+            (sum, purchase) =>
+              sum +
+              purchase.lines
+                .filter((line) => line.inventoryItemId === item.id)
+                .reduce((total, line) => total + line.qtyHundredths, 0),
+            0,
+          );
+          const sales = state.invoices
+            .filter((invoice) => invoice.stockDeducted)
+            .flatMap((invoice) =>
+              invoice.lines
+                .filter((line) => line.inventoryItemId === item.id)
+                .map((line) => ({ date: invoice.invoiceDate, qty: line.qtyHundredths })),
+            );
+          const moved = [...purchases.map((purchase) => purchase.purchaseDate), ...sales.map((sale) => sale.date)].sort();
+          return {
+            ...item,
+            stockValueCents: Math.round((item.qtyHundredths * item.unitCostCents) / 100),
+            boughtHundredths: Math.max(bought, item.boughtHundredths),
+            soldHundredths: sales.reduce((sum, sale) => sum + sale.qty, 0),
+            lastMovement: moved.length ? moved[moved.length - 1] : null,
+          };
+        })
         .sort((left, right) => left.name.localeCompare(right.name)) as T;
 
     case "save_inventory_item": {
       requireOpen();
       const input = payload.input as InventoryInput;
+      const previous = state.items.find((item) => item.id === input.id);
       const record: InventoryItem = {
         id: input.id ?? id("item"),
         name: input.name.trim(),
@@ -1415,6 +1451,9 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
         salePriceCents: input.salePriceCents ?? 0,
         isActive: true,
         stockValueCents: Math.round(((input.qtyHundredths ?? 0) * (input.unitCostCents ?? 0)) / 100),
+        boughtHundredths: previous?.boughtHundredths ?? 0,
+        soldHundredths: previous?.soldHundredths ?? 0,
+        lastMovement: previous?.lastMovement ?? null,
       };
       const index = state.items.findIndex((item) => item.id === record.id);
       if (index >= 0) state.items[index] = record;
@@ -1713,17 +1752,51 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
       requireOpen();
       const input = payload.input as PurchaseInput;
       const existing = state.purchases.find((candidate) => candidate.id === input.id);
+
+      // The same rules the engine enforces: an expense line needs somewhere to
+      // land, and a stock item that is already recorded under one account cannot
+      // be bought under another.
+      const category = (input.category ?? "").trim();
+      const hasExpenseLine = input.lines.some((line) => line.isStock === false);
+      if (hasExpenseLine && !category) {
+        throw new Error("give the expense lines a category, or link them to stock so their cost sits in Inventory instead");
+      }
+      if (!hasExpenseLine && category) {
+        const costAccounts = state.accounts.filter((account) =>
+          ["COGS", "EXPENSE", "OTHER_EXPENSE"].includes(account.accountType),
+        );
+        const purchaseAccount = costAccounts.find(
+          (account) => account.name.toLowerCase() === category.toLowerCase(),
+        );
+        for (const line of input.lines) {
+          const item = line.inventoryItemId
+            ? state.items.find((candidate) => candidate.id === line.inventoryItemId)
+            : state.items.find(
+                (candidate) => candidate.name.toLowerCase() === line.description.trim().toLowerCase(),
+              );
+          if (!item || !item.category.trim()) continue;
+          const itemAccount = costAccounts.find(
+            (account) => account.name.toLowerCase() === item.category.trim().toLowerCase(),
+          );
+          if (itemAccount && itemAccount.id !== purchaseAccount?.id) {
+            throw new Error(
+              `'${item.name}' is recorded under ${itemAccount.name}, so this purchase cannot be categorized as ${purchaseAccount?.name ?? category}. Use ${itemAccount.name}, leave the category blank, or change the item's category in Inventory first.`,
+            );
+          }
+        }
+      }
       if (existing) {
         for (const line of existing.lines) {
-          if (!line.inventoryItemId) continue;
+          if (!line.isStock || !line.inventoryItemId) continue;
           const item = state.items.find((candidate) => candidate.id === line.inventoryItemId);
           if (item) item.qtyHundredths = Math.max(0, item.qtyHundredths - line.qtyHundredths);
         }
       }
       const vendor = state.vendors.find((candidate) => candidate.id === input.vendorId);
       const lines: PurchaseLine[] = input.lines.map((line, index) => {
-        let itemId = line.inventoryItemId ?? null;
-        if (!itemId && line.description.trim()) {
+        const isStock = line.isStock !== false;
+        let itemId = isStock ? line.inventoryItemId ?? null : null;
+        if (isStock && !itemId && line.description.trim()) {
           const created: InventoryItem = {
             id: id("item"),
             name: line.description.trim(),
@@ -1736,11 +1809,14 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
             salePriceCents: line.salePriceCents,
             isActive: true,
             stockValueCents: 0,
+            boughtHundredths: 0,
+            soldHundredths: 0,
+            lastMovement: null,
           };
           state.items.push(created);
           itemId = created.id;
         }
-        if (itemId) {
+        if (isStock && itemId) {
           const item = state.items.find((candidate) => candidate.id === itemId);
           if (item) {
             const totalQty = item.qtyHundredths + line.qtyHundredths;
@@ -1749,6 +1825,7 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
               : line.unitCostCents;
             item.qtyHundredths = totalQty;
             if (line.salePriceCents > 0) item.salePriceCents = line.salePriceCents;
+            item.stockValueCents = Math.round((item.qtyHundredths * item.unitCostCents) / 100);
           }
         }
         return {
@@ -1760,6 +1837,7 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
           salePriceCents: line.salePriceCents,
           amountCents: Math.round((line.qtyHundredths * line.unitCostCents) / 100),
           inventoryItemId: itemId,
+          isStock,
         };
       });
       const record: Purchase = {
@@ -1784,7 +1862,7 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
       const purchase = state.purchases.find((candidate) => candidate.id === payload.id);
       if (purchase) {
         for (const line of purchase.lines) {
-          if (!line.inventoryItemId) continue;
+          if (!line.isStock || !line.inventoryItemId) continue;
           const item = state.items.find((candidate) => candidate.id === line.inventoryItemId);
           if (item) item.qtyHundredths = Math.max(0, item.qtyHundredths - line.qtyHundredths);
         }

@@ -564,18 +564,39 @@ export function InvoicesScreen({ revision, changed }: Props) {
 /* Purchases                                                          */
 /* ------------------------------------------------------------------ */
 
+/** The line selector value for "this is a cost, not stock". */
+const NOT_STOCK = "expense";
+const NEW_PURCHASE_CATEGORY = "__new__";
+
 export function PurchasesScreen({ revision, changed }: Props) {
   const { data, error } = useLoad(() => api.listPurchases(), [revision]);
   const vendors = useLoad<Vendor[]>(() => api.listVendors(), [revision]).data ?? [];
   const items = useLoad<InventoryItem[]>(() => api.listInventory(), [revision]).data ?? [];
+  const accounts = useLoad(() => api.listAccounts(), [revision]).data ?? [];
 
   const [editing, setEditing] = useState<Purchase | "new" | null>(null);
   const [lines, setLines] = useState<DraftLine[]>([blankLine()]);
   const [formError, setFormError] = useState<string | null>(null);
+  const [newCategory, setNewCategory] = useState(false);
+
+  // The category is a menu of the cost accounts the chart already holds, plus
+  // anything a purchase has used before. Blank is first: a purchase that is all
+  // stock needs no category at all.
+  const purchaseCategories = [
+    ...new Set([
+      ...accounts
+        .filter((account) => ["COGS", "EXPENSE", "OTHER_EXPENSE"].includes(account.accountType))
+        .map((account) => account.name),
+      ...(data ?? []).map((purchase) => purchase.category),
+    ]),
+  ]
+    .filter((category) => category.trim() && category !== "Uncategorized")
+    .sort((left, right) => left.localeCompare(right));
 
   function open(record: Purchase | "new") {
     setEditing(record);
     setFormError(null);
+    setNewCategory(false);
     if (record === "new") {
       setLines([blankLine()]);
     } else {
@@ -584,7 +605,7 @@ export function PurchasesScreen({ revision, changed }: Props) {
           ...blankLine(centsInput(line.unitCostCents)),
           description: line.description,
           qty: qtyInput(line.qtyHundredths),
-          itemId: line.inventoryItemId ? String(line.inventoryItemId) : "",
+          itemId: line.isStock ? (line.inventoryItemId ? String(line.inventoryItemId) : "") : NOT_STOCK,
         })),
       );
     }
@@ -626,7 +647,7 @@ export function PurchasesScreen({ revision, changed }: Props) {
     <>
       <div className="toolbar">
         <div className="muted small">
-          Buying stock: one record updates quantity, average cost and the books together.
+          Stock sits in Inventory until the item sells; only a line marked as an expense reaches this year's profit.
         </div>
         <button type="button" className="btn btn-primary" onClick={() => open("new")}>
           + New purchase
@@ -670,7 +691,13 @@ export function PurchasesScreen({ revision, changed }: Props) {
                   <td className="muted">
                     {purchase.lines.length} line{purchase.lines.length === 1 ? "" : "s"}
                   </td>
-                  <td>{purchase.category}</td>
+                  <td>
+                    {purchase.lines.some((line) => !line.isStock) ? (
+                      purchase.category
+                    ) : (
+                      <span className="muted">Stock</span>
+                    )}
+                  </td>
                   <td>
                     <Pill tone={purchase.isPaid ? "paid" : "unpaid"}>{purchase.isPaid ? "Paid" : "Unpaid"}</Pill>
                   </td>
@@ -701,7 +728,10 @@ export function PurchasesScreen({ revision, changed }: Props) {
                   id: editing === "new" ? null : editing.id,
                   purchaseDate: field(form, "purchaseDate") || today(),
                   vendorId: Number(field(form, "vendorId")) || null,
-                  category: field(form, "category") || "Materials",
+                  category:
+                    field(form, "category") === NEW_PURCHASE_CATEGORY
+                      ? field(form, "categoryNew")
+                      : field(form, "category"),
                   note: field(form, "note"),
                   isPaid: field(form, "status") === "Paid",
                   lines: lines
@@ -711,7 +741,8 @@ export function PurchasesScreen({ revision, changed }: Props) {
                       qtyHundredths: toHundredths(line.qty),
                       unitCostCents: toCents(line.price),
                       salePriceCents: 0,
-                      inventoryItemId: Number(line.itemId) || null,
+                      inventoryItemId: line.itemId && line.itemId !== NOT_STOCK ? Number(line.itemId) : null,
+                      isStock: line.itemId !== NOT_STOCK,
                     })),
                 });
                 changed("Purchase saved");
@@ -739,8 +770,28 @@ export function PurchasesScreen({ revision, changed }: Props) {
                   <input type="date" name="purchaseDate" defaultValue={editing === "new" ? today() : editing.purchaseDate} />
                 </div>
                 <div className="field">
-                  <label>Category</label>
-                  <input name="category" defaultValue={editing === "new" ? "Materials" : editing.category} />
+                  <label>
+                    Category <span className="hint-inline">for the expense lines only</span>
+                  </label>
+                  <select
+                    name="category"
+                    defaultValue={editing === "new" ? "" : editing.category}
+                    onChange={(event) => setNewCategory(event.target.value === NEW_PURCHASE_CATEGORY)}
+                  >
+                    <option value="">— none: stock only —</option>
+                    {purchaseCategories.map((category) => (
+                      <option key={category} value={category}>
+                        {category}
+                      </option>
+                    ))}
+                    {editing !== "new" &&
+                      editing.category.trim() !== "" &&
+                      !purchaseCategories.includes(editing.category) && (
+                        <option value={editing.category}>{editing.category}</option>
+                      )}
+                    <option value={NEW_PURCHASE_CATEGORY}>+ New category…</option>
+                  </select>
+                  {newCategory && <input name="categoryNew" placeholder="Name the new category" autoFocus />}
                 </div>
               </div>
               <div className="field-row">
@@ -760,7 +811,7 @@ export function PurchasesScreen({ revision, changed }: Props) {
               <label>Lines</label>
               <div className="line-grid line-head">
                 <span>Item or description</span>
-                <span>Link to stock</span>
+                <span>Stock or expense</span>
                 <span>Qty</span>
                 <span>Cost each</span>
                 <span />
@@ -773,12 +824,13 @@ export function PurchasesScreen({ revision, changed }: Props) {
                     onChange={(event) => updateLine(line.key, { description: event.target.value })}
                   />
                   <select value={line.itemId} onChange={(event) => pickItem(line.key, event.target.value)}>
-                    <option value="">— new item —</option>
+                    <option value="">— new stock item —</option>
                     {items.map((item) => (
                       <option key={item.id} value={item.id}>
                         {item.name}
                       </option>
                     ))}
+                    <option value={NOT_STOCK}>— not stock, just an expense —</option>
                   </select>
                   <input value={line.qty} onChange={(event) => updateLine(line.key, { qty: event.target.value })} />
                   <input value={line.price} onChange={(event) => updateLine(line.key, { price: event.target.value })} />
@@ -804,8 +856,12 @@ export function PurchasesScreen({ revision, changed }: Props) {
                 </div>
               </div>
               <div className="settings-note">
-                A name that is not in stock yet becomes a new item with this cost. Editing a purchase recalculates the average
-                cost from what is on hand, which can shift slightly if later movements exist.
+                Anything left on <strong>new stock item</strong> becomes an item at this cost and sits in Inventory until it
+                sells — its cost reaches profit then, once, as cost of goods sold. A line marked <strong>not stock</strong> is
+                a cost now, and lands in the category above, so an expense line needs one. Leaving the category on
+                <strong>none: stock only</strong> posts nothing extra: the purchase is an asset swap and the profit and loss
+                is untouched until the goods sell. Editing a purchase recalculates the average cost from what is on hand,
+                which can shift slightly if later movements exist.
               </div>
             </div>
             <div className="modal-foot">

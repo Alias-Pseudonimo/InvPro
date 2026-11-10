@@ -1,7 +1,7 @@
 //! Company file schema. Each company lives in its own SQLite file, so the
 //! schema is per-file and migrations are tracked with `PRAGMA user_version`.
 
-pub const SCHEMA_VERSION: i32 = 8;
+pub const SCHEMA_VERSION: i32 = 9;
 
 /// Everything a company file needs, including the invariants that must hold
 /// even if a future UI (or a hand-written SQL session) bypasses this crate.
@@ -412,6 +412,35 @@ pub fn migration_6() -> String {
 pub fn migration_8() -> String {
     MIGRATION_8_DDL.to_string()
 }
+
+/// v9 tells a purchase line what it is: stock on the shelf, or a cost the
+/// business has already incurred. The audit image for the table is rebuilt to
+/// name the new column.
+pub fn migration_9() -> String {
+    let mut sql = String::from(MIGRATION_9_DDL);
+    for trigger in ["ins", "upd", "del"] {
+        sql.push_str(&format!(
+            "DROP TRIGGER IF EXISTS trg_audit_purchase_lines_{trigger};\n"
+        ));
+    }
+    sql.push_str(&audit_triggers(
+        "purchase_lines",
+        PURCHASE_LINES_AUDITED_V9,
+    ));
+    sql
+}
+
+const PURCHASE_LINES_AUDITED_V9: &[&str] = &[
+    "id",
+    "purchase_id",
+    "position",
+    "description",
+    "qty_hundredths",
+    "unit_cost_cents",
+    "sale_price_cents",
+    "inventory_item_id",
+    "is_stock",
+];
 
 pub fn migration_7() -> String {
     let mut sql = String::from(MIGRATION_7_DDL);
@@ -1405,4 +1434,26 @@ BEGIN
 END;
 
 PRAGMA foreign_keys = ON;
+"#;
+
+// ---------------------------------------------------------------------------
+// Schema v9 — buying stock is not an expense
+// ---------------------------------------------------------------------------
+
+const MIGRATION_9_DDL: &str = r#"
+-- ---------------------------------------------------------------------------
+-- A purchase line already knew which stock item it brought in, but the whole
+-- purchase was posted to one expense category. The same goods then reached
+-- profit a second time when the invoice booked cost of goods sold, and the
+-- Inventory account collected nothing but credits. A line now says which it is:
+-- stock is debited to Inventory and becomes a cost only when the item sells; a
+-- line marked as an expense reaches profit immediately.
+--
+-- Every existing line keeps is_stock = 1, which is what it did — it moved stock.
+-- Its money was expensed under the old rule; opening that purchase and saving it
+-- again voids the old entry and reposts it the new way, so history can be put
+-- right without touching the ledger by hand.
+-- ---------------------------------------------------------------------------
+ALTER TABLE purchase_lines ADD COLUMN is_stock INTEGER NOT NULL DEFAULT 1
+    CHECK (is_stock IN (0, 1));
 "#;

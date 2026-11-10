@@ -74,7 +74,7 @@ const NAV: Array<{ label: string; items: NavItem[] }> = [
     label: "Money out",
     items: [
       { id: "expenses", label: "Expenses", title: "Expenses", sub: "Everything going out" },
-      { id: "purchases", label: "Purchases", title: "Purchases", sub: "Buying stock — one record updates it all" },
+      { id: "purchases", label: "Purchases", title: "Purchases", sub: "Stock or an expense — one record keeps both books right" },
       { id: "vendors", label: "Vendors", title: "Vendors", sub: "Who you pay" },
     ],
   },

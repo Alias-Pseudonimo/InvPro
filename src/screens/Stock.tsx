@@ -24,6 +24,13 @@ export function InventoryScreen({ revision, changed }: Props) {
   const { data, error } = useLoad(() => api.listInventory(), [revision]);
   const [editing, setEditing] = useState<InventoryItem | "new" | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
+  // What is actually on the shelf, and how much of it has never left. That is
+  // the question behind "do I need to order more of these?"
+  const stocked = (data ?? []).filter((item) => item.kind !== "Service");
+  const stockValue = stocked.reduce((sum, item) => sum + item.stockValueCents, 0);
+  const neverMoved = stocked.filter(
+    (item) => item.qtyHundredths > 0 && item.boughtHundredths > 0 && item.soldHundredths === 0,
+  ).length;
 
   async function remove(item: InventoryItem) {
     if (!window.confirm(`Delete ${item.name}?`)) return;
@@ -86,6 +93,11 @@ export function InventoryScreen({ revision, changed }: Props) {
                   </td>
                   <td className={`num ${item.kind !== "Service" && item.qtyHundredths <= 0 ? "money-neg" : ""}`}>
                     {item.kind === "Service" ? "—" : qtyInput(item.qtyHundredths)}
+                    {item.kind !== "Service" && item.boughtHundredths > 0 && (
+                      <div className="muted small">
+                        {qtyInput(item.boughtHundredths)} bought · {qtyInput(item.soldHundredths)} sold
+                      </div>
+                    )}
                   </td>
                   <td className="num">{money(item.unitCostCents)}</td>
                   <td className="num">{money(item.salePriceCents)}</td>
@@ -106,6 +118,14 @@ export function InventoryScreen({ revision, changed }: Props) {
           </tbody>
         </table>
       </div>
+
+      {stocked.length > 0 && (
+        <div className="muted small">
+          Stock on hand {money(stockValue)} across {stocked.length} {stocked.length === 1 ? "item" : "items"}.
+          {neverMoved > 0 &&
+            ` ${neverMoved} ${neverMoved === 1 ? "item was" : "items were"} bought and never sold or used — that money is in Inventory, which is where you will find it, not on the Profit & Loss.`}
+        </div>
+      )}
 
       {editing && (
         <Modal title={editing === "new" ? "Add item" : `Edit ${editing.name}`} onClose={() => setEditing(null)}>
@@ -168,7 +188,9 @@ export function InventoryScreen({ revision, changed }: Props) {
                 </div>
               </div>
               <div className="field">
-                <label>Category</label>
+                <label>
+                  Category <span className="hint-inline">the cost account this item is recorded under</span>
+                </label>
                 <input name="category" defaultValue={editing === "new" ? "" : editing.category} />
               </div>
             </div>
